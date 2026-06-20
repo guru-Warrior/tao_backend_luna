@@ -1,0 +1,4 @@
+bittensor==9.12.2
+bittensor-wallet>=2.1.2
+python-dotenv==1.2.1
+substrate-interface>=1.7.0

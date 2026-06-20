@@ -1,0 +1,29 @@
+# Copy to /etc/systemd/system/mempool-server.service and adjust paths + User.
+#   sudo cp backend/deploy/systemd/mempool-server.service.example /etc/systemd/system/mempool-server.service
+#   sudo nano /etc/systemd/system/mempool-server.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mempool-server.service
+#
+# Replace INSTALL_ROOT with your repository root (parent of the `backend/` folder), e.g. /home/ubuntu/tao-trading
+
+[Unit]
+Description=Bittensor mempool monitor (FastAPI / uvicorn)
+Documentation=file:INSTALL_ROOT/backend/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as a dedicated user in production (create user + chown project dir):
+# User=mempool
+# Group=mempool
+WorkingDirectory=INSTALL_ROOT/backend
+EnvironmentFile=-INSTALL_ROOT/backend/.env
+ExecStart=INSTALL_ROOT/backend/venv/bin/python -m uvicorn mempool_server:app --host 0.0.0.0 --port 8001
+Restart=on-failure
+RestartSec=5
+# Hardening (uncomment after verifying the service starts)
+# NoNewPrivileges=true
+# PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+# 10.x required for MEV Shield (mev_protection) on add_stake / unstake
+bittensor==10.2.0
+python-dotenv==1.2.1
+substrate-interface>=1.7.0
+fastapi~=0.110.1
+uvicorn[standard]>=0.32.0
+orjson>=3.9.0
