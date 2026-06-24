@@ -1505,22 +1505,35 @@ async def api_bot_positions() -> Dict[str, Any]:
             # be sold anyway (the chain will no-op), so we drop it server-side.
             # Keep in sync with `DUST_ALPHA_RAO` documented elsewhere if raised.
             DUST_STAKE_RAO = 1_000_000  # 0.001 α
+            # AsyncSubtensor's runtime_call already unwraps the ScaleType and
+            # returns a plain list; the older sync substrate-interface returns
+            # a wrapper with ``.value``. Support both shapes.
+            stake_entries = (
+                stake_result.value
+                if hasattr(stake_result, "value")
+                else stake_result
+            ) or []
             positions: list[Dict[str, Any]] = []
-            for entry in stake_result.value:
+            for entry in stake_entries:
                 stake_rao = int(entry["stake"])
                 if stake_rao < DUST_STAKE_RAO:
                     continue
                 raw = entry["hotkey"]
-                if isinstance(raw, (tuple, list)) and isinstance(raw[0], (tuple, list)):
-                    raw = bytes(raw[0])
+                # AsyncSubtensor already decodes hotkey to an ss58 string;
+                # sync substrate-interface returns raw AccountId bytes (or a
+                # nested ((b1..b32),) / (b1..b32) tuple). Handle every shape.
+                if isinstance(raw, str):
+                    hotkey_ss58 = raw
+                elif isinstance(raw, (tuple, list)) and raw and isinstance(raw[0], (tuple, list)):
+                    hotkey_ss58 = ss58_encode(bytes(raw[0]), ss58_format=42)
                 else:
-                    raw = bytes(raw)
+                    hotkey_ss58 = ss58_encode(bytes(raw), ss58_format=42)
                 positions.append(
                     {
                         "netuid": int(entry["netuid"]),
                         "alpha": round(stake_rao / 1e9, 4),
                         "stake_rao": stake_rao,
-                        "hotkey_ss58": ss58_encode(raw, ss58_format=42),
+                        "hotkey_ss58": hotkey_ss58,
                     }
                 )
 

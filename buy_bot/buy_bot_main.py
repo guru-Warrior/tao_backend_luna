@@ -303,21 +303,28 @@ async def _get_stake_positions(subtensor: AsyncSubtensor,
         result = await subtensor.substrate.runtime_call(
             "StakeInfoRuntimeApi", "get_stake_info_for_coldkey", [coldkey_ss58]
         )
+        # AsyncSubtensor's runtime_call returns a plain list (already unwrapped);
+        # sync substrate-interface returns a ``.value`` wrapper. Handle both.
+        entries = (result.value if hasattr(result, "value") else result) or []
         positions = []
-        for entry in result.value:
+        for entry in entries:
             stake_rao = int(entry["stake"])
             # Skip dust (see DUST_STAKE_RAO): these rows are un-sellable
             # leftovers from a full unstake and only waste presign/sign work.
             if stake_rao < DUST_STAKE_RAO:
                 continue
             raw = entry["hotkey"]
-            # Decode nested tuple format: ((b1,...,b32),) or (b1,...,b32)
-            if isinstance(raw, (tuple, list)) and isinstance(raw[0], (tuple, list)):
-                raw = bytes(raw[0])
+            # AsyncSubtensor already decodes hotkey to an ss58 string; sync
+            # substrate-interface returns raw AccountId bytes or a nested
+            # ((b1..b32),) / (b1..b32) tuple. Handle every shape.
+            if isinstance(raw, str):
+                hotkey_ss58 = raw
+            elif isinstance(raw, (tuple, list)) and raw and isinstance(raw[0], (tuple, list)):
+                hotkey_ss58 = ss58_encode(bytes(raw[0]), ss58_format=42)
             else:
-                raw = bytes(raw)
+                hotkey_ss58 = ss58_encode(bytes(raw), ss58_format=42)
             positions.append({
-                "hotkey_ss58": ss58_encode(raw, ss58_format=42),
+                "hotkey_ss58": hotkey_ss58,
                 "netuid":      int(entry["netuid"]),
                 "stake_rao":   stake_rao,
             })
@@ -605,7 +612,13 @@ class EnvWatcher:
 
 # Extrinsic call names (lowercase) that signal a buy or sell of alpha tokens.
 _BUY_FNS  = {"add_stake", "add_stake_limit"}
-_SELL_FNS = {"remove_stake", "remove_stake_limit"}
+# Sell-side extrinsics that carry a ``netuid`` param. ``remove_stake_full_limit``
+# (sell-all on a subnet) must be here so copy-sell fires from the MEMPOOL the
+# moment the target's sell is pending — before the block confirms — instead of
+# only catching it later via the event-based block fallback. ``unstake_all`` /
+# ``unstake_all_alpha`` are excluded: they carry no single netuid (the block
+# fallback still catches those via StakeRemoved events).
+_SELL_FNS = {"remove_stake", "remove_stake_limit", "remove_stake_full_limit"}
 
 
 def _extrinsic_signer(ext) -> str | None:
