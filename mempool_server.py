@@ -813,10 +813,11 @@ class BuyBatchReq(BaseModel):
 class SwapBatchPosition(BaseModel):
     netuid: int
     hotkey: str
+    amount: float
 
 
 class SwapBatchReq(BaseModel):
-    """Deposit panel batch swap — full stake from origins to one destination netuid."""
+    """Deposit panel batch swap — partial/full stake from origins to one destination."""
 
     positions: list[SwapBatchPosition]
     destination_netuid: int
@@ -1177,10 +1178,9 @@ async def trade_sell_all_batch(req: SellAllBatchReq) -> Dict[str, Any]:
 
 @app.post("/api/trade/swap-batch")
 async def trade_swap_batch(req: SwapBatchReq) -> Dict[str, Any]:
-    """Batch swap full stake from selected origins into one destination netuid.
+    """Batch swap stake from selected origins into one destination netuid.
 
-    Without MEV Shield: one ``Utility.force_batch`` extrinsic.
-    With MEV Shield: one encrypted extrinsic wrapping the same ``force_batch``.
+    Each position carries a TAO-equivalent ``amount`` (same basis as sell batch).
     """
     t_start = time.time()
     if not req.positions:
@@ -1199,17 +1199,19 @@ async def trade_swap_batch(req: SwapBatchReq) -> Dict[str, Any]:
         )
         return {"status": "error", "message": (base + hint).strip()}
 
-    tuples: list[tuple[int, str]] = []
+    tuples: list[tuple[int, str, float]] = []
     for p in req.positions:
         if p.netuid < 0 or p.netuid > 65535:
             return {"status": "error", "message": f"netuid out of range: {p.netuid}"}
+        if p.amount <= 0:
+            continue
         hk = (p.hotkey or "").strip()
         if not hk:
             return {"status": "error", "message": f"netuid {p.netuid}: hotkey required"}
-        tuples.append((int(p.netuid), hk))
+        tuples.append((int(p.netuid), hk, float(p.amount)))
 
     if not tuples:
-        return {"status": "error", "message": "no positions to swap"}
+        return {"status": "error", "message": "no positions with amount > 0"}
     if len(tuples) > _MAX_SWAP_BATCH_POSITIONS:
         return {
             "status": "error",

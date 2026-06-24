@@ -27,7 +27,8 @@ from config import FINNEY_WS, MEMPOOL_MAX_AGE_S
 logger = logging.getLogger(__name__)
 
 # SS58 prefixes omitted from whitelist TAO transfer history.
-_TRANSFER_EXCLUDED_ADDR_PREFIXES = ("5EYCAe5", "5DceuTr7")
+_TRANSFER_EXCLUDED_ADDR_PREFIXES = ("5EYCAe5", "5DceuTr7", "5DknG1aS")
+_TRANSFER_MIN_AMOUNT_TAO = 1.0
 
 
 class MempoolMonitor:
@@ -111,8 +112,16 @@ class MempoolMonitor:
         return any(addr.startswith(p) for p in _TRANSFER_EXCLUDED_ADDR_PREFIXES)
 
     @classmethod
-    def _transfer_event_excluded(cls, from_a: str, to_a: str) -> bool:
-        return cls._transfer_excluded_addr(from_a) or cls._transfer_excluded_addr(to_a)
+    def _transfer_event_excluded(
+        cls, from_a: str, to_a: str, amount_tao=None
+    ) -> bool:
+        if cls._transfer_excluded_addr(from_a) or cls._transfer_excluded_addr(to_a):
+            return True
+        try:
+            amt = float(amount_tao) if amount_tao is not None else 0.0
+        except (TypeError, ValueError):
+            return True
+        return amt < _TRANSFER_MIN_AMOUNT_TAO
 
     def _append_block_transfers(self, block_number: int) -> None:
         """Keep a FIFO ring of whitelist-only TAO transfer events."""
@@ -128,7 +137,7 @@ class MempoolMonitor:
                 continue
             if from_a not in wl and to_a not in wl:
                 continue
-            if self._transfer_event_excluded(from_a, to_a):
+            if self._transfer_event_excluded(from_a, to_a, t.get("amountTao")):
                 continue
             row = {
                 "block": block_number,
@@ -1355,7 +1364,9 @@ class MempoolMonitor:
             r
             for r in self._transfer_history
             if not self._transfer_event_excluded(
-                r.get("from") or "", r.get("to") or ""
+                r.get("from") or "",
+                r.get("to") or "",
+                r.get("amountTao"),
             )
         ]
 

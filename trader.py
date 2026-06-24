@@ -17,6 +17,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# On-chain ``DefaultMinStake`` floor (500_000 RAO) + headroom for swap fees.
+_MIN_SWAP_TAO = 0.0006
+
 # Lazy-loaded on first MEV trade so non-MEV paths never import mev_shield_submit.
 _mev_shield_submit_fns: Optional[
     Tuple[
@@ -709,6 +712,71 @@ class Trader:
             price = tao_per_alpha * (1 - tolerance)
         return Balance.from_tao(price).rao
 
+    def _tao_per_alpha(self, netuid: int, subnet: Optional[Any] = None) -> Optional[float]:
+        """Spot τ per α for ``netuid`` (same sources as ``_get_limit_price``)."""
+        import price_cache as _price_cache
+
+        tao_per_alpha: Optional[float] = None
+        if subnet is not None:
+            try:
+                tao_per_alpha = float(subnet.price.tao)
+            except Exception:
+                tao_per_alpha = None
+        if tao_per_alpha is None:
+            tao_per_alpha = _price_cache.get_fresh_tao_per_alpha(netuid)
+        if tao_per_alpha is None:
+            try:
+                pool = self._subtensor.subnet(netuid=netuid)
+                tao_per_alpha = float(pool.price.tao)
+            except Exception:
+                tao_per_alpha = None
+        return tao_per_alpha if tao_per_alpha and tao_per_alpha > 0 else None
+
+    def _get_swap_cross_limit_price_rao(
+        self,
+        origin_netuid: int,
+        dest_netuid: int,
+        tolerance: float,
+        origin_subnet: Optional[Any] = None,
+        dest_subnet: Optional[Any] = None,
+    ) -> int:
+        """Worst acceptable origin/dest α-price ratio for ``swap_stake_limit`` (RAO).
+
+        Subtensor compares ``limit_price / 1e9`` to the current cross-subnet
+        ratio (origin τ/α ÷ dest τ/α). It errors with ``ZeroMaxStakeAmount``
+        when the limit is above spot. Passing ``0`` disables the cap.
+        """
+        from bittensor.utils.balance import Balance
+
+        if tolerance >= 0.999999:
+            return 0
+
+        o_p = self._tao_per_alpha(origin_netuid, subnet=origin_subnet)
+        d_p = self._tao_per_alpha(dest_netuid, subnet=dest_subnet)
+        if o_p is None or d_p is None:
+            return 0
+
+        current_ratio = o_p / d_p
+        limit_ratio = current_ratio * max(0.0, 1.0 - float(tolerance))
+        if limit_ratio <= 0:
+            return 0
+        return int(Balance.from_tao(limit_ratio).rao)
+
+    @staticmethod
+    def _swap_batch_failure_message(
+        skipped: list[PositionTradeResult],
+        *,
+        prefix: str = "No valid stake positions to swap",
+    ) -> str:
+        if not skipped:
+            return prefix
+        details = "; ".join(
+            f"n{p.netuid}: {p.message}" for p in skipped[:4]
+        )
+        if len(skipped) > 4:
+            details += f"; +{len(skipped) - 4} more"
+        return f"{prefix} ({details})"
+
     def buy(
         self,
         netuid: int,
@@ -1096,19 +1164,22 @@ class Trader:
 
     def _build_swap_batch_inner_calls(
         self,
-        positions: list[tuple[int, str]],
+        positions: list[tuple[int, str, float]],
         dest_netuid: int,
         tolerance: float,
         no_slippage: bool,
     ) -> tuple[list[Any], list[tuple[int, str]], list[PositionTradeResult]]:
-        """Build ``Utility.force_batch`` inner calls for batch swap (MEV and non-MEV)."""
+        """Build ``Utility.force_batch`` inner calls for batch swap (MEV and non-MEV).
+
+        ``positions`` entries are ``(origin_netuid, hotkey_ss58, amount_tao)``.
+        """
         from bittensor.core.extrinsics.pallets import SubtensorModule
 
         inner_calls: list[Any] = []
         swapped_positions: list[tuple[int, str]] = []
         skipped: list[PositionTradeResult] = []
 
-        for origin_netuid, hotkey in positions:
+        for origin_netuid, hotkey, amount_tao in positions:
             validator_hk = (hotkey or "").strip() or self._hotkey_ss58
             if origin_netuid == dest_netuid:
                 skipped.append(
@@ -1121,10 +1192,26 @@ class Trader:
                 )
                 continue
 
-            alpha_rao, _origin_sn = self._full_stake_alpha_rao(
-                origin_netuid, validator_hk
+            if float(amount_tao) < _MIN_SWAP_TAO:
+                skipped.append(
+                    PositionTradeResult(
+                        netuid=origin_netuid,
+                        hotkey=validator_hk,
+                        success=False,
+                        message=(
+                            f"Swap amount {amount_tao:.4f}τ below minimum "
+                            f"{_MIN_SWAP_TAO:.4f}τ"
+                        ),
+                    )
+                )
+                continue
+
+            unstake_rao, total_rao, req_tao, origin_sn = (
+                self._unstake_alpha_rao_for_tao_amount(
+                    origin_netuid, validator_hk, amount_tao, subnet=None
+                )
             )
-            if alpha_rao <= 0:
+            if total_rao <= 0:
                 skipped.append(
                     PositionTradeResult(
                         netuid=origin_netuid,
@@ -1134,31 +1221,73 @@ class Trader:
                     )
                 )
                 continue
+            if unstake_rao <= 0:
+                skipped.append(
+                    PositionTradeResult(
+                        netuid=origin_netuid,
+                        hotkey=validator_hk,
+                        success=False,
+                        message=(
+                            f"Swap amount too small (~{amount_tao:.4f}τ "
+                            f"→ {req_tao:.4f}τ requested)"
+                        ),
+                    )
+                )
+                continue
 
-            if no_slippage:
-                inner_calls.append(
-                    SubtensorModule(self._subtensor).swap_stake(
+            try:
+                if no_slippage:
+                    inner_calls.append(
+                        SubtensorModule(self._subtensor).swap_stake(
+                            hotkey=validator_hk,
+                            origin_netuid=origin_netuid,
+                            destination_netuid=dest_netuid,
+                            alpha_amount=unstake_rao,
+                        )
+                    )
+                else:
+                    dest_sn = None
+                    try:
+                        dest_sn = self._subtensor.subnet(netuid=dest_netuid)
+                    except Exception:
+                        pass
+                    limit_price_rao = self._get_swap_cross_limit_price_rao(
+                        origin_netuid,
+                        dest_netuid,
+                        tolerance,
+                        origin_subnet=origin_sn,
+                        dest_subnet=dest_sn,
+                    )
+                    if limit_price_rao == 0:
+                        inner_calls.append(
+                            SubtensorModule(self._subtensor).swap_stake(
+                                hotkey=validator_hk,
+                                origin_netuid=origin_netuid,
+                                destination_netuid=dest_netuid,
+                                alpha_amount=unstake_rao,
+                            )
+                        )
+                    else:
+                        inner_calls.append(
+                            SubtensorModule(self._subtensor).swap_stake_limit(
+                                hotkey=validator_hk,
+                                origin_netuid=origin_netuid,
+                                destination_netuid=dest_netuid,
+                                alpha_amount=unstake_rao,
+                                limit_price=limit_price_rao,
+                                allow_partial=True,
+                            )
+                        )
+                swapped_positions.append((origin_netuid, validator_hk))
+            except Exception as exc:
+                skipped.append(
+                    PositionTradeResult(
+                        netuid=origin_netuid,
                         hotkey=validator_hk,
-                        origin_netuid=origin_netuid,
-                        destination_netuid=dest_netuid,
-                        alpha_amount=alpha_rao,
+                        success=False,
+                        message=str(exc),
                     )
                 )
-            else:
-                limit_price = self._get_limit_price(
-                    dest_netuid, tolerance, "buy"
-                )
-                inner_calls.append(
-                    SubtensorModule(self._subtensor).swap_stake_limit(
-                        hotkey=validator_hk,
-                        origin_netuid=origin_netuid,
-                        destination_netuid=dest_netuid,
-                        alpha_amount=alpha_rao,
-                        limit_price=limit_price,
-                        allow_partial=True,
-                    )
-                )
-            swapped_positions.append((origin_netuid, validator_hk))
 
         return inner_calls, swapped_positions, skipped
 
@@ -1748,15 +1877,15 @@ class Trader:
 
     def swap_batch(
         self,
-        positions: list[tuple[int, str]],
+        positions: list[tuple[int, str, float]],
         dest_netuid: int,
         slippage_pct: float = 5.0,
         no_slippage: bool = False,
         mev_shield: bool = False,
     ) -> TradeResult:
-        """Swap full stake from many origin netuids into one destination netuid.
+        """Swap stake from many origin netuids into one destination netuid.
 
-        ``positions`` entries are ``(origin_netuid, hotkey_ss58)``.
+        ``positions`` entries are ``(origin_netuid, hotkey_ss58, amount_tao)``.
         Without MEV Shield: one ``Utility.force_batch`` extrinsic.
         With MEV Shield: one encrypted extrinsic wrapping the same ``force_batch``.
         """
@@ -1788,7 +1917,7 @@ class Trader:
                         elapsed = (time.time() - t0) * 1000
                         return TradeResult(
                             False,
-                            "No valid stake positions to swap",
+                            self._swap_batch_failure_message(skipped),
                             elapsed_ms=elapsed,
                             positions=skipped,
                         )
@@ -1845,10 +1974,12 @@ class Trader:
                 swapped_labels = [f"n{n}" for n, _ in swapped_positions]
 
                 if not inner_calls:
+                    skipped_local = _skipped if _skipped else []
                     return TradeResult(
                         False,
-                        "No valid stake positions to swap",
+                        self._swap_batch_failure_message(skipped_local),
                         elapsed_ms=(time.time() - t0) * 1000,
+                        positions=skipped_local,
                     )
 
                 if len(inner_calls) == 1:
