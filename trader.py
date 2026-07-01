@@ -227,16 +227,32 @@ def _mev_raise_error_kw() -> Dict[str, Any]:
     return {}
 
 
-def _mev_batch_wait_for_reveal() -> bool:
-    """Whether batch MEV ``force_batch`` polls for inner reveal after inclusion.
+def _mev_block_until_reveal() -> bool:
+    """When True, hold the trader lock through MEV Shield inclusion + inner reveal.
 
-    Single-position sells always wait for reveal. Batch MEV uses one encrypted
-    extrinsic; default is to wait for reveal so all positions are confirmed.
+    Default **False**: the encrypted outer extrinsic is submitted and the call
+    returns as soon as it is accepted into the pool, so ``self._lock`` is released
+    immediately and the next trade can proceed without waiting many blocks for
+    inclusion/reveal. Set ``MEV_SHIELD_BLOCK_UNTIL_REVEAL=1`` to restore the legacy
+    blocking behavior.
     """
-    raw = os.environ.get("MEV_SHIELD_BATCH_WAIT_REVEAL", "1").strip().lower()
-    if raw in ("0", "false", "no", "off"):
-        return False
-    return True
+    raw = os.environ.get("MEV_SHIELD_BLOCK_UNTIL_REVEAL", "").strip().lower()
+    if raw:
+        return raw not in ("0", "false", "no", "off")
+    # Back-compat: the older batch-only knob still works (default off = non-blocking).
+    raw_batch = os.environ.get("MEV_SHIELD_BATCH_WAIT_REVEAL", "0").strip().lower()
+    return raw_batch not in ("0", "false", "no", "off")
+
+
+def _mev_submit_wait_kwargs() -> Dict[str, bool]:
+    """Wait flags for MEV Shield submits. Non-blocking by default so the trader
+    lock is freed right after the encrypted extrinsic is submitted."""
+    block = _mev_block_until_reveal()
+    return {
+        "wait_for_inclusion": block,
+        "wait_for_finalization": False,
+        "wait_for_revealed_execution": block,
+    }
 
 
 def _extrinsic_response_suggests_outdated(resp: Any) -> bool:
@@ -256,12 +272,32 @@ class PositionTradeResult:
 
 
 @dataclass
+class RoundTripReservation:
+    """Accumulated round-trip buys on one (netuid, hotkey); sell uses ``sell_nonce``."""
+
+    round_trip_id: str
+    netuid: int
+    hotkey: str
+    buy_nonce: int
+    sell_nonce: int
+    buy_amount_tao: float
+    slippage_pct: float
+    no_slippage: bool
+    created_at: float
+
+
+@dataclass
 class TradeResult:
     success: bool
     message: str
     extrinsic_hash: Optional[str] = None
     elapsed_ms: Optional[float] = None
     positions: Optional[list[PositionTradeResult]] = None
+    round_trip_id: Optional[str] = None
+    buy_nonce: Optional[int] = None
+    sell_nonce: Optional[int] = None
+    hotkey: Optional[str] = None
+    round_trip_buy_tao: Optional[float] = None
 
 
 class Trader:
@@ -290,6 +326,10 @@ class Trader:
         self._nonce_lock = threading.Lock()
         self._next_nonce: Optional[int] = None
         self._last_nonce_use_ts: float = 0.0
+        # One-block buy→sell round trips: sell nonce reserved at buy time,
+        # consumed when the user presses Remove.
+        self._round_trips: Dict[str, RoundTripReservation] = {}
+        self._round_trip_by_pos: Dict[tuple[int, str], str] = {}
 
         # Immutable block-hash memoization (genesis + era-birth blocks). Scoped
         # to this Trader's own substrate instance. See
@@ -339,6 +379,23 @@ class Trader:
 
     # ---- nonce cache -----------------------------------------------------
 
+    def _maybe_refresh_nonce_from_chain(self) -> None:
+        """Invalidate cached nonce when idle too long (see ``_reserve_nonce``)."""
+        now = time.monotonic()
+        if (
+            self._next_nonce is not None
+            and self._last_nonce_use_ts > 0.0
+            and (now - self._last_nonce_use_ts) > _nonce_staleness_sec()
+        ):
+            self._next_nonce = None
+
+    def _fetch_next_nonce_from_chain(self) -> int:
+        return int(
+            self._subtensor.substrate.get_account_next_index(
+                self._wallet.coldkeypub.ss58_address
+            )
+        )
+
     def _reserve_nonce(self) -> int:
         """Return next nonce, refreshing from chain when unknown or stale.
 
@@ -350,23 +407,32 @@ class Trader:
         fails-stale, second succeeds" round trip that easily exceeds 1 s.
         """
         with self._nonce_lock:
-            now = time.monotonic()
-            if (
-                self._next_nonce is not None
-                and self._last_nonce_use_ts > 0.0
-                and (now - self._last_nonce_use_ts) > _nonce_staleness_sec()
-            ):
-                self._next_nonce = None
+            self._maybe_refresh_nonce_from_chain()
             if self._next_nonce is None:
-                self._next_nonce = int(
-                    self._subtensor.substrate.get_account_next_index(
-                        self._wallet.coldkeypub.ss58_address
-                    )
-                )
+                self._next_nonce = self._fetch_next_nonce_from_chain()
             n = self._next_nonce
             self._next_nonce = n + 1
-            self._last_nonce_use_ts = now
+            self._last_nonce_use_ts = time.monotonic()
             return n
+
+    def _reserve_nonce_pair(self) -> tuple[int, int]:
+        """Reserve consecutive nonces ``(N, N+1)`` for buy then sell."""
+        with self._nonce_lock:
+            self._maybe_refresh_nonce_from_chain()
+            if self._next_nonce is None:
+                self._next_nonce = self._fetch_next_nonce_from_chain()
+            buy_n = self._next_nonce
+            sell_n = buy_n + 1
+            self._next_nonce = sell_n + 1
+            self._last_nonce_use_ts = time.monotonic()
+            return buy_n, sell_n
+
+    def _sync_nonce_after_explicit(self, used_nonce: int) -> None:
+        """Keep the optimistic cache aligned after a caller-chosen nonce."""
+        with self._nonce_lock:
+            if self._next_nonce is None or self._next_nonce <= used_nonce:
+                self._next_nonce = used_nonce + 1
+            self._last_nonce_use_ts = time.monotonic()
 
     def _reset_nonce(self) -> None:
         with self._nonce_lock:
@@ -533,13 +599,17 @@ class Trader:
 
     # ---- fast submit (bypass SDK wrapper's get_extrinsic_fee RPC) --------
 
-    def _submit_fast(self, call: Any) -> None:
+    def _submit_fast(self, call: Any, *, nonce: Optional[int] = None) -> None:
         """Sign + submit with minimal RPC overhead.
 
         Skips ``Subtensor.sign_and_send_extrinsic`` because that helper, even
         with both waits disabled, still issues a ``get_payment_info`` RPC to
         populate ``extrinsic_fee`` on the response object — ~50–150 ms of
         latency we never consume. We instead drive ``substrate`` directly.
+
+        When ``nonce`` is given the extrinsic is signed with that exact account
+        nonce (used by one-block round-trip buy/sell). Otherwise the next
+        nonce is taken from the optimistic cache via ``_reserve_nonce``.
 
         Extra optimisation: pre-fill ``era['current']`` with the head block
         number that the mempool monitor already tracks (via
@@ -561,7 +631,7 @@ class Trader:
             # submit. On the happy (attempt=0) path this is the same object
             # reference we had before — zero extra work.
             sub = self._subtensor.substrate
-            nonce = self._reserve_nonce()
+            use_nonce = nonce if nonce is not None else self._reserve_nonce()
             era: Dict[str, Any] = {"period": 64}
             cached_bn = _head_cache.get_fresh_head_number()
             if cached_bn is not None:
@@ -570,7 +640,7 @@ class Trader:
                 ext = sub.create_signed_extrinsic(
                     call=call,
                     keypair=keypair,
-                    nonce=nonce,
+                    nonce=use_nonce,
                     era=era,
                 )
                 sub.submit_extrinsic(
@@ -578,6 +648,8 @@ class Trader:
                     wait_for_inclusion=False,
                     wait_for_finalization=False,
                 )
+                if nonce is not None:
+                    self._sync_nonce_after_explicit(use_nonce)
                 # Success: warm the next era-birth block hash on the background
                 # connection so the next trade after an era rollover isn't the
                 # one paying the ``chain_getBlockHash`` round trip. Pure
@@ -777,6 +849,104 @@ class Trader:
             details += f"; +{len(skipped) - 4} more"
         return f"{prefix} ({details})"
 
+    def _store_round_trip(
+        self,
+        *,
+        netuid: int,
+        hotkey: str,
+        buy_nonce: int,
+        sell_nonce: int,
+        buy_amount_tao: float,
+        slippage_pct: float,
+        no_slippage: bool,
+    ) -> RoundTripReservation:
+        import uuid
+
+        pos_key = (netuid, hotkey)
+        existing_id = self._round_trip_by_pos.get(pos_key)
+        if existing_id:
+            existing = self._round_trips.get(existing_id)
+            if existing is not None:
+                existing.buy_nonce = buy_nonce
+                existing.sell_nonce = sell_nonce
+                existing.buy_amount_tao += buy_amount_tao
+                existing.slippage_pct = slippage_pct
+                existing.no_slippage = no_slippage
+                return existing
+
+        rt_id = f"rt-{netuid}-{buy_nonce}-{uuid.uuid4().hex[:8]}"
+        reservation = RoundTripReservation(
+            round_trip_id=rt_id,
+            netuid=netuid,
+            hotkey=hotkey,
+            buy_nonce=buy_nonce,
+            sell_nonce=sell_nonce,
+            buy_amount_tao=buy_amount_tao,
+            slippage_pct=slippage_pct,
+            no_slippage=no_slippage,
+            created_at=time.time(),
+        )
+        self._round_trips[rt_id] = reservation
+        self._round_trip_by_pos[pos_key] = rt_id
+        return reservation
+
+    def sell_round_trip(self, round_trip_id: str) -> TradeResult:
+        """Submit the reserved sell extrinsic (nonce N+1) for a round-trip buy."""
+        from bittensor.core.extrinsics.pallets import SubtensorModule
+
+        reservation = self._round_trips.pop(round_trip_id, None)
+        if reservation is None:
+            return TradeResult(
+                False,
+                f"Unknown or expired round-trip id: {round_trip_id}",
+            )
+        self._round_trip_by_pos.pop((reservation.netuid, reservation.hotkey), None)
+
+        t0 = time.time()
+        tolerance = reservation.slippage_pct / 100.0
+        validator_hk = reservation.hotkey
+        netuid = reservation.netuid
+
+        try:
+            with self._lock:
+                if reservation.no_slippage:
+                    call = SubtensorModule(self._subtensor).remove_stake_full_limit(
+                        netuid=netuid,
+                        hotkey=validator_hk,
+                        limit_price=None,
+                    )
+                else:
+                    limit_price = self._get_limit_price(netuid, tolerance, "sell")
+                    call = SubtensorModule(self._subtensor).remove_stake_full_limit(
+                        netuid=netuid,
+                        hotkey=validator_hk,
+                        limit_price=limit_price,
+                    )
+                self._submit_fast(call, nonce=reservation.sell_nonce)
+        except Exception as e:
+            elapsed = (time.time() - t0) * 1000
+            logger.error(
+                "round-trip sell failed (%.0fms) id=%s: %s",
+                elapsed,
+                round_trip_id,
+                e,
+            )
+            return TradeResult(False, str(e), elapsed_ms=elapsed)
+
+        elapsed = (time.time() - t0) * 1000
+        msg = (
+            f"Submitted round-trip sell n{netuid} full position "
+            f"(nonce {reservation.sell_nonce}, {elapsed:.0f}ms)"
+        )
+        logger.info(
+            "round-trip sell submitted id=%s buy_nonce=%d sell_nonce=%d n%d",
+            round_trip_id,
+            reservation.buy_nonce,
+            reservation.sell_nonce,
+            netuid,
+        )
+        return TradeResult(success=True, message=msg, elapsed_ms=elapsed)
+
     def buy(
         self,
         netuid: int,
@@ -787,6 +957,7 @@ class Trader:
         no_slippage: bool = False,
         mev_shield: bool = False,
         decoy_tao: float = 0.0,
+        round_trip: bool = False,
     ) -> TradeResult:
         from bittensor.core.extrinsics.pallets import SubtensorModule
         from bittensor.utils.balance import Balance
@@ -794,10 +965,26 @@ class Trader:
         t0 = time.time()
         amount_rao = Balance.from_tao(amount_tao).rao
         tolerance = slippage_pct / 100.0
+        validator_hk = (hotkey or "").strip() or self._hotkey_ss58
+
+        if round_trip and mev_shield:
+            return TradeResult(
+                False,
+                "One-block round-trip is not supported with MEV Shield",
+                elapsed_ms=0.0,
+            )
 
         # Serialize all Subtensor RPC on this instance (shared WS is not thread-safe).
         try:
             with self._lock:
+                buy_nonce: Optional[int] = None
+                sell_nonce: Optional[int] = None
+                if round_trip:
+                    # One nonce per buy (no pair skip). Sell nonce is buy+1 locally
+                    # so consecutive stakes stay ready in the mempool; Remove submits
+                    # the reserved sell nonce after the last buy.
+                    buy_nonce = self._reserve_nonce()
+                    sell_nonce = buy_nonce + 1
                 # Non-MEV: SubtensorModule + sign_and_send_extrinsic. MEV: mev_shield_submit (lazy-imported).
                 if mev_shield:
                     # submit_encrypted_extrinsic + blocks_for_revealed_execution (see mev_shield_submit).
@@ -821,9 +1008,7 @@ class Trader:
                                 rate_tolerance=tolerance,
                                 **mev_kw,
                                 **raise_kw,
-                                wait_for_inclusion=True,
-                                wait_for_finalization=False,
-                                wait_for_revealed_execution=True,
+                                **_mev_submit_wait_kwargs(),
                             )
                         except Exception as e:
                             if (
@@ -887,26 +1072,58 @@ class Trader:
                         allow_partial=allow_partial,
                     )
 
-                self._submit_fast(call)
+                if round_trip:
+                    assert buy_nonce is not None
+                    self._submit_fast(call, nonce=buy_nonce)
+                else:
+                    self._submit_fast(call)
         except Exception as e:
             elapsed = (time.time() - t0) * 1000
             logger.error("buy failed (%.0fms): %s", elapsed, e)
+            if round_trip:
+                self._reset_nonce()
             return TradeResult(False, str(e), elapsed_ms=elapsed)
+
+        reservation: Optional[RoundTripReservation] = None
+        if round_trip:
+            assert buy_nonce is not None and sell_nonce is not None
+            reservation = self._store_round_trip(
+                netuid=netuid,
+                hotkey=validator_hk,
+                buy_nonce=buy_nonce,
+                sell_nonce=sell_nonce,
+                buy_amount_tao=amount_tao,
+                slippage_pct=slippage_pct,
+                no_slippage=no_slippage,
+            )
 
         # Emergency decoy: fire a never-matching remove_stake_limit on a daemon
         # thread so the HTTP response isn't delayed by the second submit. The
         # decoy lands in the mempool ~1 RPC round-trip after the real buy.
         # Suppressed when mev_shield=True (the encrypted-extrinsic flow has its
         # own privacy guarantees) and obviously a no-op when decoy_tao<=0.
-        if not mev_shield and decoy_tao and decoy_tao > 0:
+        # Also suppressed for round-trip buys — the decoy would consume the
+        # reserved sell nonce.
+        if not mev_shield and not round_trip and decoy_tao and decoy_tao > 0:
             self._fire_decoy_sell_async(netuid, float(decoy_tao))
 
         elapsed = (time.time() - t0) * 1000
         logger.info("buy submitted (%.0fms) netuid=%d amount=%.4f", elapsed, netuid, amount_tao)
+        rt_note = ""
+        if reservation is not None:
+            rt_note = (
+                f" [round-trip total {reservation.buy_amount_tao:.4f}τ"
+                f", sell nonce {reservation.sell_nonce}]"
+            )
         return TradeResult(
             success=True,
-            message=f"Submitted buy n{netuid} {amount_tao}τ ({elapsed:.0f}ms)",
+            message=f"Submitted buy n{netuid} {amount_tao}τ ({elapsed:.0f}ms){rt_note}",
             elapsed_ms=elapsed,
+            round_trip_id=reservation.round_trip_id if reservation else None,
+            buy_nonce=reservation.buy_nonce if reservation else None,
+            sell_nonce=reservation.sell_nonce if reservation else None,
+            hotkey=validator_hk if reservation else None,
+            round_trip_buy_tao=reservation.buy_amount_tao if reservation else None,
         )
 
     # ---- emergency decoy sell --------------------------------------------
@@ -1064,6 +1281,14 @@ class Trader:
 
         return unstake_rao, total_rao, req_tao, sn
 
+    @staticmethod
+    def _unstake_is_full_position(unstake_rao: int, total_rao: int) -> bool:
+        """True when the sell consumes essentially all stake (incl. dust tail)."""
+        if total_rao <= 0:
+            return False
+        dust_rao = 1_000_000  # ~0.001 α — matches wallet dust filter
+        return unstake_rao >= total_rao or (total_rao - unstake_rao) <= dust_rao
+
     def _build_sell_batch_inner_calls(
         self,
         positions: list[tuple[int, str, float]],
@@ -1105,7 +1330,7 @@ class Trader:
                 )
                 continue
 
-            is_full = unstake_rao >= total_rao or unstake_rao >= total_rao - 1
+            is_full = self._unstake_is_full_position(unstake_rao, total_rao)
 
             if no_slippage:
                 inner_calls.append(
@@ -1294,10 +1519,13 @@ class Trader:
     def _submit_mev_shield_calls(
         self,
         inner_calls: list[Any],
-        *,
-        wait_for_revealed_execution: bool = True,
     ) -> TradeResult:
-        """Submit one or more calls via MEV Shield (``force_batch`` when len > 1). Caller holds lock."""
+        """Submit one or more calls via MEV Shield (``force_batch`` when len > 1).
+
+        Non-blocking by default (see ``_mev_submit_wait_kwargs``): returns as soon
+        as the encrypted extrinsic is submitted so the caller holds the lock only
+        briefly instead of across inclusion + reveal.
+        """
         _, _, _, submit_calls_mev_shield = _get_mev_shield_submit_fns()
         mev_kw = _mev_shield_period_kw()
         raise_kw = _mev_raise_error_kw()
@@ -1314,9 +1542,7 @@ class Trader:
                     inner_calls,
                     **mev_kw,
                     **raise_kw,
-                    wait_for_inclusion=True,
-                    wait_for_finalization=False,
-                    wait_for_revealed_execution=wait_for_revealed_execution,
+                    **_mev_submit_wait_kwargs(),
                 )
             except Exception as e:
                 if attempt < max_mev - 1 and _is_tx_outdated_error(e):
@@ -1367,13 +1593,14 @@ class Trader:
         no_slippage: bool,
         *,
         allow_partial: bool = True,
-        wait_for_revealed_execution: bool = True,
     ) -> TradeResult:
-        """Submit one MEV Shield unstake. Caller must hold ``self._lock``."""
+        """Submit one MEV Shield unstake. Caller must hold ``self._lock`` briefly.
+
+        Non-blocking by default (see ``_mev_submit_wait_kwargs``)."""
         from bittensor.utils.balance import Balance
 
         t0 = time.time()
-        is_full = unstake_rao >= total_rao or unstake_rao >= total_rao - 1
+        is_full = self._unstake_is_full_position(unstake_rao, total_rao)
         _, unstake_all_mev_shield, unstake_mev_shield, _ = _get_mev_shield_submit_fns()
         mev_kw = _mev_shield_period_kw()
         raise_kw = _mev_raise_error_kw()
@@ -1392,9 +1619,7 @@ class Trader:
                         None if no_slippage else tolerance,
                         **mev_kw,
                         **raise_kw,
-                        wait_for_inclusion=True,
-                        wait_for_finalization=False,
-                        wait_for_revealed_execution=wait_for_revealed_execution,
+                        **_mev_submit_wait_kwargs(),
                     )
                 else:
                     alpha_amt = Balance.from_rao(unstake_rao, netuid=netuid)
@@ -1409,9 +1634,7 @@ class Trader:
                         safe_unstaking=not no_slippage,
                         **mev_kw,
                         **raise_kw,
-                        wait_for_inclusion=True,
-                        wait_for_finalization=False,
-                        wait_for_revealed_execution=wait_for_revealed_execution,
+                        **_mev_submit_wait_kwargs(),
                     )
             except Exception as e:
                 if attempt < max_mev - 1 and _is_tx_outdated_error(e):
@@ -1493,7 +1716,7 @@ class Trader:
                         elapsed_ms=(time.time() - t0) * 1000,
                     )
 
-                is_full = unstake_rao >= total_rao or unstake_rao >= total_rao - 1
+                is_full = self._unstake_is_full_position(unstake_rao, total_rao)
 
                 sell_limit_price: Optional[float] = None
                 if not no_slippage:
@@ -1511,7 +1734,6 @@ class Trader:
                         tolerance,
                         no_slippage,
                         allow_partial=allow_partial,
-                        wait_for_revealed_execution=True,
                     )
 
                 if no_slippage:
@@ -1663,10 +1885,7 @@ class Trader:
                             elapsed_ms=elapsed,
                             positions=skipped,
                         )
-                    r = self._submit_mev_shield_calls(
-                        inner_calls,
-                        wait_for_revealed_execution=_mev_batch_wait_for_reveal(),
-                    )
+                    r = self._submit_mev_shield_calls(inner_calls)
             except Exception as e:
                 elapsed = (time.time() - t0) * 1000
                 logger.error("buy_batch MEV failed (%.0fms): %s", elapsed, e)
@@ -1792,10 +2011,7 @@ class Trader:
                             elapsed_ms=elapsed,
                             positions=skipped,
                         )
-                    r = self._submit_mev_shield_calls(
-                        inner_calls,
-                        wait_for_revealed_execution=_mev_batch_wait_for_reveal(),
-                    )
+                    r = self._submit_mev_shield_calls(inner_calls)
             except Exception as e:
                 elapsed = (time.time() - t0) * 1000
                 logger.error("sell_all_batch MEV failed (%.0fms): %s", elapsed, e)
@@ -1921,10 +2137,7 @@ class Trader:
                             elapsed_ms=elapsed,
                             positions=skipped,
                         )
-                    r = self._submit_mev_shield_calls(
-                        inner_calls,
-                        wait_for_revealed_execution=_mev_batch_wait_for_reveal(),
-                    )
+                    r = self._submit_mev_shield_calls(inner_calls)
             except Exception as e:
                 elapsed = (time.time() - t0) * 1000
                 logger.error("swap_batch MEV failed (%.0fms): %s", elapsed, e)

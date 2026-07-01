@@ -1,0 +1,30 @@
+{
+  "rules": [
+    {
+      "address": "5EUL5ip21yV2DvTCz67owoTTwfnsLdmAq87SVg7VAqracFEc",
+      "created_at": 1782632471981.0,
+      "enabled": true,
+      "id": "mqxhcii5wqpdmf",
+      "mode": "mirror_sell"
+    },
+    {
+      "address": "5GGqgt9z78cceSf4jQug3mcA3eyGeNkEniuPH3ZUBpYYtCsq",
+      "created_at": 1782651498937.0,
+      "enabled": true,
+      "id": "mqxsobsp96ked2",
+      "mode": "mirror_sell"
+    },
+    {
+      "address": "5HYNfCz4kwHicDyemtLm4EFkjJ7zHVDiCLLvouYWtsqzw775",
+      "created_at": 1782661465952.0,
+      "enabled": true,
+      "id": "mqxylye8dzy0x1",
+      "mode": "mirror_sell"
+    }
+  ],
+  "settings": {
+    "copy_trade_amount": 0.0,
+    "home_netuids": "",
+    "sell_netuids": ""
+  }
+}

@@ -173,8 +173,12 @@ def _put(msg: Dict[str, Any]) -> None:
         pass
 
 
-def _catch_up_blocks_to_target(mon: MempoolMonitor, target_bn: int) -> tuple[int, bool]:
-    """Process ``_last_seen_block + 1 .. target_bn`` (capped). Returns ``(last_bn, advanced)``."""
+def _catch_up_blocks_to_target(mon: MempoolMonitor, target_bn: int, substrate=None) -> tuple[int, bool]:
+    """Process ``_last_seen_block + 1 .. target_bn`` (capped). Returns ``(last_bn, advanced)``.
+
+    ``substrate`` (when given) is forwarded to ``process_new_block`` so the
+    dedicated block-processing thread runs every RPC on its own connection.
+    """
     prev = mon._last_seen_block or 0
     if target_bn <= prev:
         return prev, False
@@ -187,15 +191,16 @@ def _catch_up_blocks_to_target(mon: MempoolMonitor, target_bn: int) -> tuple[int
         )
         target_bn = prev + MEMPOOL_MAX_CATCHUP_BLOCKS
     for b in range(prev + 1, target_bn + 1):
-        mon.process_new_block(b)
+        mon.process_new_block(b, substrate=substrate)
     return target_bn, True
 
 
-def _poll_chain_head_catchup(mon: MempoolMonitor, current_block: int) -> tuple[int, bool]:
+def _poll_chain_head_catchup(mon: MempoolMonitor, current_block: int, substrate=None) -> tuple[int, bool]:
     """Read best head via RPC; catch up to tip (same block-number parsing as bootstrap)."""
     import chain_head_cache as _head_cache
+    sub = substrate or mon.substrate
     try:
-        header = mon.substrate.rpc_request("chain_getHeader", [])
+        header = sub.rpc_request("chain_getHeader", [])
         head_bn = block_number_from_chain_get_header(header)
         if head_bn is None:
             logger.warning("chain_getHeader returned no parsable block number")
@@ -203,7 +208,7 @@ def _poll_chain_head_catchup(mon: MempoolMonitor, current_block: int) -> tuple[i
         # Keep trader's era fast-path warm even when the subscription WS is
         # flaky — this branch polls the head itself so we know the number.
         _head_cache.put(head_bn)
-        last_bn, advanced = _catch_up_blocks_to_target(mon, head_bn)
+        last_bn, advanced = _catch_up_blocks_to_target(mon, head_bn, substrate=substrate)
         if advanced:
             return last_bn, True
         return current_block, False
@@ -277,8 +282,114 @@ def _bg_fetch_thread(mon: MempoolMonitor) -> None:
             mon.process_bg_fetch_queue(
                 max_items=5, substrate=bg_substrate, subtensor=bg_subtensor
             )
+            # Throttle: yield briefly between batches even while the queue is
+            # busy so these refresh RPCs never saturate the shared public
+            # endpoint and starve the block-processing thread. Each iteration
+            # already drains up to BALANCE_BATCH_SIZE balances in one query_multi
+            # round trip, so this small pause bounds balance RPC rate without
+            # meaningfully delaying convergence.
+            time.sleep(float(os.environ.get("BG_FETCH_THROTTLE_SEC", "0.05")))
         except Exception as exc:
             logger.warning("BG-FETCH err: %s", exc, exc_info=True)
+            time.sleep(1)
+
+
+def _block_processing_thread(
+    mon: MempoolMonitor,
+    new_block_event: threading.Event,
+    new_block_number: list,
+    current_block_holder: list,
+    block_processed_event: threading.Event,
+    wallet_addr: str | None,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Dedicated thread that runs all block processing on its own WS connection.
+
+    Block processing (``process_new_block``) measured at 230–860 ms per block —
+    almost entirely I/O (full price-table refresh + ``get_events`` + block body)
+    rather than CPU. Running it on the main monitor loop serialized it behind
+    ``poll_mempool`` + ``build_ui_snapshot``, so a single slow block (or a brief
+    RPC stall) stalled the whole loop and the UI fell behind the chain head and
+    then "jumped" once it caught up.
+
+    By moving it here with its own ``SubstrateInterface`` it runs concurrently
+    with the main loop's mempool polling and never blocks UI updates. The thread
+    detects new blocks via the subscription event (instant) with a periodic
+    ``chain_getHeader`` poll as a fallback, publishes the latest processed block
+    number through ``current_block_holder`` and nudges the main loop to push a
+    fresh snapshot + wallet refresh via ``block_processed_event``.
+    """
+    from substrateinterface import SubstrateInterface
+
+    block_sub = None
+    while not STOP.is_set() and block_sub is None:
+        try:
+            block_sub = SubstrateInterface(url=FINNEY_WS)
+        except Exception as exc:
+            logger.error("block-proc: substrate connect failed (retrying): %s", exc)
+            time.sleep(2)
+    if block_sub is None:
+        return
+
+    last_head_poll = 0.0
+    while not STOP.is_set():
+        try:
+            advanced = False
+
+            # Periodic best-head poll — independent of subscription WS health.
+            now = time.monotonic()
+            if now - last_head_poll >= MEMPOOL_HEAD_POLL_SEC:
+                last_head_poll = now
+                new_bn, adv = _poll_chain_head_catchup(
+                    mon, current_block_holder[0], substrate=block_sub
+                )
+                if adv:
+                    current_block_holder[0] = new_bn
+                    advanced = True
+
+            # Subscription-signaled new block (instant path).
+            if new_block_event.is_set():
+                new_block_event.clear()
+                bn = new_block_number[0]
+                if bn > (mon._last_seen_block or 0):
+                    last_bn, adv = _catch_up_blocks_to_target(
+                        mon, bn, substrate=block_sub
+                    )
+                    if adv:
+                        current_block_holder[0] = last_bn
+                        advanced = True
+
+            if advanced:
+                # Instant, lightweight block-number push — decoupled from the
+                # heavier snapshot build on the main loop. The UI anchors its
+                # block timer to the moment ``currentBlock`` changes, so
+                # delivering the number the instant the block is detected
+                # (subscription latency only) makes the counter tick smoothly
+                # every ~12 s regardless of snapshot cost. The full snapshot
+                # (mempool / last-block tables) still follows via the main loop.
+                loop.call_soon_threadsafe(
+                    _put,
+                    {"type": "block", "currentBlock": current_block_holder[0]},
+                )
+                # Nudge the main loop to broadcast the refreshed Last-block data
+                # immediately (even if the mempool fingerprint is unchanged) and
+                # refresh the wallet panel on the new block.
+                block_processed_event.set()
+                if wallet_addr:
+                    loop.call_soon_threadsafe(
+                        _put,
+                        {
+                            "type": "fetch_wallet",
+                            "address": wallet_addr,
+                            "block": current_block_holder[0],
+                        },
+                    )
+
+            # Block until the next subscription signal (or short timeout so the
+            # head-poll fallback keeps running when the subscription is quiet).
+            new_block_event.wait(timeout=0.2)
+        except Exception as exc:
+            logger.exception("block-proc thread failed: %s", exc)
             time.sleep(1)
 
 
@@ -306,7 +417,9 @@ def monitor_thread(loop: asyncio.AbstractEventLoop) -> None:
     )
     sub_t.start()
 
-    # Bootstrap: fetch initial block via RPC (subscription hasn't fired yet)
+    # Bootstrap: fetch initial block via RPC (subscription hasn't fired yet).
+    # Runs single-threaded on ``mon.substrate`` *before* the block-processing
+    # thread starts, so there is no concurrent use of that connection.
     try:
         header = mon.substrate.rpc_request('chain_getHeader', [])
         bn_boot = block_number_from_chain_get_header(header)
@@ -317,6 +430,7 @@ def monitor_thread(loop: asyncio.AbstractEventLoop) -> None:
             p = st_bridge.fetch_prices_sync(mon.substrate)
             if p:
                 mon._tracker_prices = p
+                mon._last_price_fetch = time.monotonic()
         except Exception:
             pass
         mon.last_block_data = mon.parse_block_stake_transactions(current_block)
@@ -327,53 +441,46 @@ def monitor_thread(loop: asyncio.AbstractEventLoop) -> None:
         logger.error("Mempool monitor bootstrap failed: %s", exc, exc_info=True)
         current_block = 0
 
-    last_head_poll = 0.0
+    # Block processing now lives on its own thread + connection so it never
+    # serializes behind the mempool poll / snapshot build below. The main loop
+    # only polls the mempool, builds the snapshot for the latest processed
+    # block, and broadcasts it.
+    current_block_holder = [current_block]
+    block_processed_event = threading.Event()
+    blk_t = threading.Thread(
+        target=_block_processing_thread,
+        args=(
+            mon,
+            new_block_event,
+            new_block_number,
+            current_block_holder,
+            block_processed_event,
+            wallet_addr,
+            loop,
+        ),
+        daemon=True,
+    )
+    blk_t.start()
+
     while not STOP.is_set():
         try:
-            new_block = False
-
-            # Poll best head periodically — does not rely on subscription WS being ready.
-            now = time.monotonic()
-            if now - last_head_poll >= MEMPOOL_HEAD_POLL_SEC:
-                last_head_poll = now
-                new_bn, advanced = _poll_chain_head_catchup(mon, current_block)
-                if advanced:
-                    current_block = new_bn
-                    new_block = True
-
-            # Check if subscription thread signaled a new block
-            if new_block_event.is_set():
-                new_block_event.clear()
-                bn = new_block_number[0]
-                prev_seen = mon._last_seen_block or 0
-                if bn > prev_seen:
-                    last_bn, advanced = _catch_up_blocks_to_target(mon, bn)
-                    if advanced:
-                        current_block = last_bn
-                        new_block = True
-
             # Fast mempool-only poll
             mon.poll_mempool()
 
+            current_block = current_block_holder[0]
             snap = mon.build_ui_snapshot(current_block)
             _fp = _snapshot_fingerprint(snap)
+            new_block = block_processed_event.is_set()
+            if new_block:
+                block_processed_event.clear()
             forced = _force_broadcast_event.is_set()
             if forced:
                 _force_broadcast_event.clear()
-            if forced or _fp != _monitor_thread_last_fp:
+            if forced or new_block or _fp != _monitor_thread_last_fp:
                 _monitor_thread_last_fp = _fp
                 loop.call_soon_threadsafe(
                     _put,
-                    {"type": "snapshot", "data": snap, "fp": _fp, "force": forced},
-                )
-            if new_block and wallet_addr:
-                loop.call_soon_threadsafe(
-                    _put,
-                    {
-                        "type": "fetch_wallet",
-                        "address": wallet_addr,
-                        "block": current_block,
-                    },
+                    {"type": "snapshot", "data": snap, "fp": _fp, "force": forced or new_block},
                 )
             if mon._mempool_stake or new_block:
                 time.sleep(MEMPOOL_POLL_BUSY_SEC)
@@ -579,6 +686,15 @@ async def queue_consumer() -> None:
                 except Exception as e:
                     raw = _json_dumps_compact({"type": "wallet_error", "message": str(e)})
                     await hub.broadcast_raw(raw)
+        elif mtype == "block":
+            # Lightweight block-number tick, broadcast immediately (no fp
+            # dedupe, no snapshot build) so the UI block counter/timer updates
+            # the instant the chain advances.
+            await hub.broadcast_raw(
+                _json_dumps_compact(
+                    {"type": "block", "currentBlock": msg.get("currentBlock")}
+                )
+            )
         elif mtype == "error":
             await hub.broadcast_raw(_json_dumps_compact(msg))
 
@@ -781,6 +897,11 @@ class TradeReq(BaseModel):
     # should pretend to remove (alpha = emergency_tao / spot_price).
     emergency: bool = False
     emergency_tao: float = 0.0
+    # Buy only: reserve consecutive nonces N/N+1 so Remove can submit the sell
+    # with the pre-planned nonce N+1 (one-block round-trip, no transfer).
+    round_trip: bool = False
+    # Sell only: consume a round-trip reservation from an earlier buy.
+    round_trip_id: Optional[str] = None
 
 
 class SellAllBatchPosition(BaseModel):
@@ -869,7 +990,7 @@ async def trade(req: TradeReq) -> Dict[str, Any]:
 
     if req.action not in ("buy", "sell"):
         return {"status": "error", "message": "action must be 'buy' or 'sell'"}
-    if req.amount <= 0:
+    if req.amount <= 0 and not (req.action == "sell" and req.round_trip_id):
         return {"status": "error", "message": "amount must be > 0"}
 
     try:
@@ -915,7 +1036,13 @@ async def trade(req: TradeReq) -> Dict[str, Any]:
                     no_slippage=req.no_slippage,
                     mev_shield=req.mev_shield,
                     decoy_tao=decoy_tao,
+                    round_trip=req.round_trip,
                 ),
+            )
+        elif req.round_trip_id:
+            fut = loop.run_in_executor(
+                None,
+                lambda: trader.sell_round_trip(req.round_trip_id),
             )
         else:
             fut = loop.run_in_executor(
@@ -984,6 +1111,16 @@ async def trade(req: TradeReq) -> Dict[str, Any]:
         resp["hash"] = result.extrinsic_hash
     if result.elapsed_ms is not None:
         resp["elapsed"] = f"{result.elapsed_ms:.0f}ms"
+    if result.round_trip_id:
+        resp["roundTripId"] = result.round_trip_id
+    if result.buy_nonce is not None:
+        resp["buyNonce"] = result.buy_nonce
+    if result.sell_nonce is not None:
+        resp["sellNonce"] = result.sell_nonce
+    if result.hotkey:
+        resp["hotkey"] = result.hotkey
+    if result.round_trip_buy_tao is not None:
+        resp["roundTripBuyTao"] = result.round_trip_buy_tao
     return resp
 
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -41,6 +42,22 @@ class MempoolMonitor:
         self._mempool_pool = {}
         self._mempool_stake = {}
         self._tracker_prices = {}
+        # Throttle the (expensive) full price-table refresh. ``fetch_prices_sync``
+        # runs two ``query_map`` calls (~512 records each) that measured at
+        # 120–780 ms per block on the public Finney RPC — by far the single
+        # largest cost in ``process_new_block``. Subnet prices drift only
+        # slightly per block, so refreshing every ``_price_refresh_sec`` (≈ one
+        # block) instead of on *every* block removes that cost from the hot
+        # block-processing path without any visible accuracy loss in the UI.
+        self._price_refresh_sec: float = float(
+            os.environ.get("PRICE_REFRESH_SEC", "12")
+        )
+        self._last_price_fetch: float = 0.0
+        # Separate throttle for the main-loop snapshot path (alpha→TAO conversion
+        # for sell rows). Block thread also refreshes ``_tracker_prices``; this
+        # lets the mempool panel fill sell amounts immediately even before the
+        # next block is processed.
+        self._last_mempool_prices_fetch: float = 0.0
         self._my_addresses = self._build_my_addresses()
         st_bridge.ensure_tracker_loaded()
         self.last_block_data = []
@@ -54,8 +71,21 @@ class MempoolMonitor:
         self._price_cache_ttl = 12  # refresh every ~12s (~1 block)
         # Cache subnet types (netuid -> is_dynamic) to avoid repeated queries
         self.subnet_type_cache = {}
-        # Cache stake amounts (hotkey, netuid) -> stake_amount_tao for unstake_all queries
+        # Cache stake TAO for full-unstake mempool rows: (coldkey, hotkey, netuid) -> float
         self.stake_cache = {}
+        # Max synchronous stake lookups per snapshot for Rem·F rows (immediate amount).
+        self._mempool_stake_sync_max: int = int(
+            os.environ.get("MEMPOOL_STAKE_SYNC_MAX", "6")
+        )
+        # Per-snapshot scratch: coldkey -> StakeInfoRuntimeApi rows (avoid N identical RPCs).
+        self._runtime_stake_entries_scratch: dict[str, list] = {}
+        # Spot τ/α frozen when a pending extrinsic first enters our mempool view.
+        # Comparing limit_price to *current* spot drifts while the tx sits in the
+        # pool (often showing 8–10% when the user submitted 1–5%). Keyed by
+        # (canonical tx_hash, netuid).
+        self._mempool_spot_at_seen: dict[tuple[str, int], float] = {}
+        # Spot table captured when the last block was processed (for Last-block Slip).
+        self._last_block_tao_per_alpha: dict[int, float] = {}
         # Initialize bittensor subtensor for price queries if available
         self.subtensor = None
         # Invalidate mempool stake display cache only when pending extrinsic set changes
@@ -85,6 +115,24 @@ class MempoolMonitor:
         # Free balance only changes on finalized blocks; monitor clears cache each new block.
         # Long TTL avoids repeated System.Account queries between block boundaries.
         self.free_balance_cache_ttl = 3600.0
+        # Per-address background refresh cadence for the displayed free balance.
+        # Replaces the old per-block mass invalidation (which re-queued a
+        # ``System.Account`` query for EVERY address that appeared in a block,
+        # every block — an RPC storm on busy blocks that contended with block
+        # processing on the shared public endpoint). Now ``_free_tao_cached``
+        # always returns the last known value immediately and only queues a
+        # background refresh once the cached entry ages past this interval, so a
+        # displayed balance can lag reality by at most ``_balance_refresh_sec``
+        # (cheap, never-blanking, and bounded RPC volume).
+        self._balance_refresh_sec: float = float(
+            os.environ.get("BALANCE_REFRESH_SEC", "60")
+        )
+        # Max addresses collapsed into a single ``query_multi`` balance refresh.
+        # One round trip per batch keeps balance RPC volume flat even when a busy
+        # block re-stales many transacting addresses.
+        self._balance_batch_size: int = int(
+            os.environ.get("BALANCE_BATCH_SIZE", "64")
+        )
         # Background RPC fetch queue: addresses/stakes to query without blocking snapshot
         self._bg_fetch_balance_queue = set()   # set of addresses
         self._bg_fetch_stake_queue = set()     # set of (address, netuid)
@@ -171,8 +219,9 @@ class MempoolMonitor:
                 )
             self._transfer_history = self._transfer_history[:limit]
 
-    def _extrinsic_hex_to_tracker_ext(self, ext_hex):
-        extrinsic = self.substrate.decode_scale(
+    def _extrinsic_hex_to_tracker_ext(self, ext_hex, substrate=None):
+        sub = substrate or self.substrate
+        extrinsic = sub.decode_scale(
             type_string="Extrinsic",
             scale_bytes=ext_hex,
         )
@@ -228,7 +277,7 @@ class MempoolMonitor:
             "EVM.moveStake", "EVM.transferStake", "EVM.swapStake",
         ))
 
-    def _tracker_merged_op_amount_tao(self, merged, prices):
+    def _tracker_merged_op_amount_tao(self, merged, prices, substrate=None):
         import stake_tracker as st
 
         kind = merged["kind"]
@@ -253,12 +302,12 @@ class MempoolMonitor:
             if p and p.get("alpha_in", 0) > 0:
                 return (v / 1e9) * (p["tao_in"] / p["alpha_in"])
         if pn is not None:
-            tao = self._convert_alpha_to_tao(v, pn)
+            tao = self._convert_alpha_to_tao(v, pn, substrate=substrate)
             if tao is not None:
                 return float(tao)
         return None
 
-    def _tracker_event_to_last_block_row(self, ev, success):
+    def _tracker_event_to_last_block_row(self, ev, success, substrate=None):
         kind = ev["kind"]
         coldkey = str(ev.get("coldkey", ""))
         hotkey = str(ev.get("hotkey", "")) if ev.get("hotkey") is not None else coldkey
@@ -283,7 +332,7 @@ class MempoolMonitor:
             dest = ev.get("dest_netuid")
             amount = 0.0
             if ar is not None and origin is not None:
-                c = self._convert_alpha_to_tao(ar, origin)
+                c = self._convert_alpha_to_tao(ar, origin, substrate=substrate)
                 amount = float(c) if c is not None else None
             return {
                 "extrinsic_idx": ev.get("ext_idx"),
@@ -304,7 +353,7 @@ class MempoolMonitor:
             amount = 0.0
             pn = origin if origin is not None else dest
             if ar is not None and pn is not None:
-                c = self._convert_alpha_to_tao(ar, pn)
+                c = self._convert_alpha_to_tao(ar, pn, substrate=substrate)
                 amount = float(c) if c is not None else None
             return {
                 "extrinsic_idx": ev.get("ext_idx"),
@@ -561,7 +610,7 @@ class MempoolMonitor:
 
 
     
-    def _get_subnet_price(self, netuid):
+    def _get_subnet_price(self, netuid, substrate=None):
         """Get subnet price (alpha per TAO) for dynamic subnets.
 
         Cached with TTL; stale entries are refreshed automatically.
@@ -569,13 +618,31 @@ class MempoolMonitor:
         if netuid is None:
             return None
 
+        # Prefer the warm price table (``_tracker_prices``) that the dedicated
+        # block thread refreshes every ~12 s. ``subnet.price`` IS the AMM spot
+        # ``tao_in / alpha_in``, so ``alpha_per_tao = alpha_in / tao_in`` here is
+        # the same value — but read from memory instead of a slow
+        # ``subtensor.subnet()`` RPC on the main snapshot loop. This removes the
+        # recurring per-12s main-loop stall that delayed snapshot (and thus
+        # block-number) pushes.
+        key = netuid[0] if isinstance(netuid, tuple) else netuid
+        tp = self._tracker_prices.get(key) if self._tracker_prices else None
+        if tp:
+            try:
+                ai = float(tp.get("alpha_in") or 0)
+                ti = float(tp.get("tao_in") or 0)
+                if ai > 0 and ti > 0:
+                    return ai / ti
+            except (TypeError, ValueError):
+                pass
+
         now = time.monotonic()
         cached = self.subnet_price_cache.get(netuid)
         if cached is not None:
             if now - cached['time'] < self._price_cache_ttl:
                 return cached['price']
 
-        price_alpha_per_tao = self._fetch_subnet_price(netuid)
+        price_alpha_per_tao = self._fetch_subnet_price(netuid, substrate=substrate)
         if price_alpha_per_tao is not None:
             self.subnet_price_cache[netuid] = {'price': price_alpha_per_tao, 'time': now}
             # Expose the fresh spot to other threads (e.g. Trader) so they can
@@ -593,9 +660,15 @@ class MempoolMonitor:
             }
         return price_alpha_per_tao if price_alpha_per_tao is not None else (cached['price'] if cached else None)
 
-    def _fetch_subnet_price(self, netuid):
-        """Query on-chain price for a subnet. Returns alpha_per_tao or None."""
-        if self.subtensor is not None:
+    def _fetch_subnet_price(self, netuid, substrate=None):
+        """Query on-chain price for a subnet. Returns alpha_per_tao or None.
+
+        When ``substrate`` is provided (dedicated block-processing thread), the
+        query is issued on that connection and the shared ``self.subtensor``
+        (bittensor SDK, not thread-safe) is skipped to avoid cross-thread WS
+        corruption.
+        """
+        if substrate is None and self.subtensor is not None:
             try:
                 subnet_info = self.subtensor.subnet(netuid=netuid)
                 if subnet_info and hasattr(subnet_info, 'price') and subnet_info.price:
@@ -606,7 +679,7 @@ class MempoolMonitor:
                 pass
 
         try:
-            result = self.substrate.query(
+            result = (substrate or self.substrate).query(
                 module='SubtensorModule',
                 storage_function='SubnetInfo',
                 params=[netuid]
@@ -654,7 +727,14 @@ class MempoolMonitor:
         return None
 
     def _free_tao_cached(self, address, scratch):
-        """Cache-only free balance lookup — queues miss for background fetch."""
+        """Cached free-balance lookup with TTL-based background refresh.
+
+        Always returns the last known value immediately (never blanks the cell);
+        queues a background ``System.Account`` refresh only when the cached
+        entry is older than ``_balance_refresh_sec`` or absent. This replaces
+        the previous per-block mass invalidation so busy blocks no longer
+        trigger an RPC storm on the shared endpoint.
+        """
         if not address:
             return None
         if address in scratch:
@@ -662,15 +742,178 @@ class MempoolMonitor:
         cached = self.free_balance_cache.get(address)
         if cached:
             scratch[address] = cached.get('balance')
+            ts = cached.get('time') or 0.0
+            if (time.time() - ts) >= self._balance_refresh_sec:
+                self._bg_fetch_balance_queue.add(address)
             return scratch[address]
         self._bg_fetch_balance_queue.add(address)
         return None
 
-    def _get_stake_cached(self, address, netuid):
-        """Cache-only stake lookup — queues miss for background fetch."""
-        if address is None or netuid is None:
+    @staticmethod
+    def _decode_stake_hotkey(raw) -> str | None:
+        """Normalize hotkey from StakeInfoRuntimeApi entries to SS58."""
+        if raw is None:
             return None
-        cache_key = (address, netuid)
+        if isinstance(raw, str):
+            return raw
+        try:
+            from substrateinterface.utils.ss58 import ss58_encode
+
+            if isinstance(raw, (tuple, list)) and raw and isinstance(raw[0], (tuple, list)):
+                return ss58_encode(bytes(raw[0]), ss58_format=42)
+            return ss58_encode(bytes(raw), ss58_format=42)
+        except Exception:
+            return None
+
+    def _stake_cache_key(self, coldkey, hotkey, netuid):
+        if coldkey is None or hotkey is None or netuid is None:
+            return None
+        try:
+            from stake_tracker import _normalize_ss58
+
+            ck = _normalize_ss58(coldkey) or str(coldkey)
+            hk = _normalize_ss58(hotkey) or str(hotkey)
+        except Exception:
+            ck, hk = str(coldkey), str(hotkey)
+        return (ck, hk, int(netuid))
+
+    def _stake_rpc_substrate(self, substrate=None):
+        """Substrate connection for StakeInfoRuntimeApi (needs bittensor type registry)."""
+        if substrate is not None:
+            return substrate
+        if self.subtensor is not None and getattr(self.subtensor, "substrate", None) is not None:
+            return self.subtensor.substrate
+        return self.substrate
+
+    def _stake_entries_for_coldkey(self, coldkey, substrate=None):
+        """Cached ``get_stake_info_for_coldkey`` rows for one snapshot pass."""
+        ck = str(coldkey)
+        if ck in self._runtime_stake_entries_scratch:
+            return self._runtime_stake_entries_scratch[ck]
+        use_sub = self._stake_rpc_substrate(substrate)
+        entries = []
+        try:
+            if hasattr(use_sub, "runtime_call"):
+                result = use_sub.runtime_call(
+                    "StakeInfoRuntimeApi",
+                    "get_stake_info_for_coldkey",
+                    [coldkey],
+                )
+                entries = result.value if hasattr(result, "value") else result
+                entries = list(entries or [])
+        except Exception:
+            entries = []
+        self._runtime_stake_entries_scratch[ck] = entries
+        return entries
+
+    def _query_stake_tao_for_position(
+        self,
+        coldkey,
+        hotkey,
+        netuid,
+        substrate=None,
+        subtensor=None,
+    ):
+        """Return TAO-equivalent stake for (coldkey, validator hotkey, netuid).
+
+        ``remove_stake_full_limit`` extrinsics carry no amount; this uses
+        ``StakeInfoRuntimeApi.get_stake_info_for_coldkey`` (same as the wallet
+        panel) rather than the legacy ``SubtensorModule.Stake`` map keyed only
+        by hotkey — which misses most dynamic-TAO positions.
+        """
+        cache_key = self._stake_cache_key(coldkey, hotkey, netuid)
+        if cache_key is None:
+            return None
+        if cache_key in self.stake_cache:
+            return self.stake_cache[cache_key]
+
+        use_sub = self._stake_rpc_substrate(substrate)
+        use_bt = subtensor if subtensor is not None else self.subtensor
+        want_ck, want_hk, nid = cache_key[0], cache_key[1], cache_key[2]
+
+        try:
+            for entry in self._stake_entries_for_coldkey(want_ck, substrate=use_sub):
+                try:
+                    en = int(entry.get("netuid", -1))
+                except (TypeError, ValueError):
+                    continue
+                if en != nid:
+                    continue
+                entry_hk = self._decode_stake_hotkey(entry.get("hotkey"))
+                if not entry_hk or entry_hk != want_hk:
+                    continue
+                stake_rao = int(entry.get("stake", 0) or 0)
+                if stake_rao <= 0:
+                    self.stake_cache[cache_key] = 0.0
+                    return 0.0
+                tao = self._convert_alpha_to_tao(
+                    stake_rao, nid, substrate=use_sub
+                )
+                if tao is not None and tao > 0:
+                    val = float(tao)
+                    self.stake_cache[cache_key] = val
+                    return val
+        except Exception:
+            pass
+
+        if use_bt is not None:
+            try:
+                infos = None
+                if hasattr(use_bt, "get_stake_info_for_coldkey"):
+                    infos = use_bt.get_stake_info_for_coldkey(coldkey_ss58=want_ck)
+                elif hasattr(use_bt, "get_stake_for_coldkey"):
+                    infos = use_bt.get_stake_for_coldkey(want_ck)
+                if infos:
+                    for si in infos:
+                        info_netuid = getattr(si, "netuid", None)
+                        if info_netuid is not None and int(info_netuid) != nid:
+                            continue
+                        info_hk_ss58 = getattr(si, "hotkey_ss58", None)
+                        if not info_hk_ss58:
+                            info_hk = getattr(si, "hotkey", None)
+                            info_hk_ss58 = (
+                                info_hk.ss58_address
+                                if hasattr(info_hk, "ss58_address")
+                                else str(info_hk or "")
+                            )
+                        if not info_hk_ss58 or str(info_hk_ss58) != want_hk:
+                            continue
+                        stake = getattr(si, "stake", None)
+                        if not stake:
+                            continue
+                        try:
+                            val = None
+                            subnet = (
+                                use_bt.subnet(netuid=nid)
+                                if hasattr(use_bt, "subnet")
+                                else None
+                            )
+                            if subnet and hasattr(subnet, "alpha_to_tao"):
+                                try:
+                                    converted = subnet.alpha_to_tao(stake)
+                                    val = float(getattr(converted, "tao", converted))
+                                except Exception:
+                                    pass
+                            if val is None:
+                                val = float(
+                                    getattr(stake, "tao", stake)
+                                    if hasattr(stake, "tao")
+                                    else stake
+                                )
+                            self.stake_cache[cache_key] = val
+                            return val
+                        except (TypeError, ValueError):
+                            pass
+            except Exception:
+                pass
+
+        return None
+
+    def _get_stake_cached(self, coldkey, hotkey, netuid):
+        """Cache-only stake lookup — queues miss for background fetch."""
+        cache_key = self._stake_cache_key(coldkey, hotkey, netuid)
+        if cache_key is None:
+            return None
         if cache_key in self.stake_cache:
             return self.stake_cache[cache_key]
         self._bg_fetch_stake_queue.add(cache_key)
@@ -685,21 +928,35 @@ class MempoolMonitor:
         use_sub = substrate or self.substrate
         use_bt = subtensor if subtensor is not None else self.subtensor
 
-        done = 0
-        while self._bg_fetch_balance_queue and done < max_items:
-            addr = self._bg_fetch_balance_queue.pop()
-            if addr not in self.free_balance_cache:
+        # Balances are drained in a single ``query_multi`` round trip instead of
+        # one ``System.Account`` call per address. A busy block re-queues every
+        # transacting address; fetching them one at a time hammered the shared
+        # public endpoint and contended with block processing. Batching collapses
+        # up to ``_balance_batch_size`` addresses into one RPC, so accuracy is
+        # kept (every queued address is still refreshed) at a fraction of the
+        # round trips.
+        if self._bg_fetch_balance_queue:
+            batch = []
+            while self._bg_fetch_balance_queue and len(batch) < self._balance_batch_size:
+                batch.append(self._bg_fetch_balance_queue.pop())
+            if batch:
                 try:
-                    self._bg_fetch_balance(addr, use_sub)
+                    self._bg_fetch_balances_batch(batch, use_sub)
                 except Exception:
                     pass
-                done += 1
 
+        done = 0
         while self._bg_fetch_stake_queue and done < max_items:
             cache_key = self._bg_fetch_stake_queue.pop()
             if cache_key not in self.stake_cache:
                 try:
-                    self._bg_fetch_stake(cache_key[0], cache_key[1], use_sub, use_bt)
+                    self._query_stake_tao_for_position(
+                        cache_key[0],
+                        cache_key[1],
+                        cache_key[2],
+                        substrate=use_sub,
+                        subtensor=use_bt,
+                    )
                 except Exception:
                     pass
                 done += 1
@@ -731,56 +988,101 @@ class MempoolMonitor:
         except Exception:
             pass
 
-    def _bg_fetch_stake(self, hotkey_address, netuid, substrate, subtensor):
-        """Fetch stake using provided connections, update shared cache."""
-        if hotkey_address is None or netuid is None:
+    @staticmethod
+    def _free_tao_from_account_value(data):
+        """Extract free balance (TAO) from a decoded System.Account value."""
+        if not isinstance(data, dict):
+            return None
+        free_rao = 0
+        if 'data' in data and isinstance(data['data'], dict):
+            free_rao = int(data['data'].get('free', 0) or 0)
+        elif 'free' in data:
+            free_rao = int(data.get('free', 0) or 0)
+        return free_rao / 1e9
+
+    def _bg_fetch_balances_batch(self, addresses, substrate):
+        """Fetch many free balances in ONE ``query_multi`` round trip.
+
+        Builds a ``System.Account`` storage key per address and resolves them
+        all in a single RPC call, then updates the shared cache. Falls back to
+        per-address queries if batching is unavailable or fails, so behaviour is
+        never worse than the original one-at-a-time path.
+        """
+        if not addresses:
             return
-        cache_key = (hotkey_address, netuid)
-        if subtensor is not None and isinstance(hotkey_address, str) and not hotkey_address.startswith('0x'):
+        storage_keys = []
+        valid = []
+        for addr in addresses:
+            if not addr:
+                continue
             try:
-                infos = None
-                if hasattr(subtensor, 'get_stake_info_for_coldkey'):
-                    infos = subtensor.get_stake_info_for_coldkey(coldkey_ss58=hotkey_address)
-                elif hasattr(subtensor, 'get_stake_for_coldkey'):
-                    infos = subtensor.get_stake_for_coldkey(hotkey_address)
-                if infos:
-                    total_tao = 0.0
-                    subnet = subtensor.subnet(netuid=netuid) if hasattr(subtensor, 'subnet') else None
-                    for si in infos:
-                        info_netuid = getattr(si, 'netuid', None)
-                        if info_netuid is not None and info_netuid != netuid:
-                            continue
-                        stake = getattr(si, 'stake', None)
-                        if not stake:
-                            continue
-                        try:
-                            val = float(getattr(stake, 'tao', stake) if hasattr(stake, 'tao') else stake)
-                            if subnet and hasattr(subnet, 'alpha_to_tao'):
-                                try:
-                                    converted = subnet.alpha_to_tao(stake)
-                                    val = float(getattr(converted, 'tao', converted))
-                                except Exception:
-                                    pass
-                            total_tao += val
-                        except (TypeError, ValueError):
-                            pass
-                    self.stake_cache[cache_key] = total_tao
-                    return
+                sk = substrate.create_storage_key('System', 'Account', [addr])
             except Exception:
-                pass
+                continue
+            storage_keys.append(sk)
+            valid.append(addr)
+        if not storage_keys:
+            return
         try:
-            result = substrate.query(
-                module='SubtensorModule',
-                storage_function='Stake',
-                params=[netuid, hotkey_address]
-            )
-            if result and hasattr(result, 'value') and result.value:
-                rao = int(result.value)
-                if rao > 0:
-                    self.stake_cache[cache_key] = rao / 1e9
+            results = substrate.query_multi(storage_keys)
+        except Exception:
+            # Batch path unavailable/failed — degrade to per-address fetches.
+            for addr in valid:
+                try:
+                    self._bg_fetch_balance(addr, substrate)
+                except Exception:
+                    pass
+            return
+        now = time.time()
+        for i, item in enumerate(results):
+            try:
+                value_obj = item[1]
+            except (TypeError, IndexError, KeyError):
+                value_obj = item
+            addr = valid[i] if i < len(valid) else None
+            if addr is None:
+                continue
+            balance_tao = self._free_tao_from_account_value(getattr(value_obj, 'value', None))
+            self.free_balance_cache[addr] = {'balance': balance_tao, 'time': now}
+
+    @staticmethod
+    def _is_full_unstake_kind(kind: str | None) -> bool:
+        k = (kind or "").lower()
+        return "unstake_all" in k or "remove_stake_full" in k
+
+    def _mempool_sell_needs_price_refresh(self, merged, prices) -> bool:
+        """True when a partial sell has alpha RAO but TAO conversion failed."""
+        import stake_tracker as st
+
+        if st.stake_type(merged.get("kind")) != "REMOVE":
+            return False
+        if self._is_full_unstake_kind(merged.get("kind")):
+            return False
+        amt = self._tracker_merged_op_amount_tao(merged, prices)
+        if amt is not None and amt > 0:
+            return False
+        v = merged.get("amount_rao") or merged.get("alpha_amount")
+        return bool(v)
+
+    def _maybe_refresh_tracker_prices(self, substrate=None, *, force: bool = False) -> None:
+        """Refresh subnet price table for mempool sell amount (alpha→TAO) conversion."""
+        now = time.monotonic()
+        if (
+            not force
+            and self._tracker_prices
+            and (now - self._last_mempool_prices_fetch) < self._price_refresh_sec
+        ):
+            return
+        sub = substrate or self.substrate
+        try:
+            p = st_bridge.fetch_prices_sync(sub)
+            if p:
+                self._tracker_prices = p
+            self._last_mempool_prices_fetch = now
         except Exception:
             pass
-    
+
+
     def _is_dynamic_subnet(self, netuid):
         """Check if a subnet is a dynamic subnet (uses alpha tokens)
         
@@ -804,7 +1106,7 @@ class MempoolMonitor:
         self.subnet_type_cache[netuid] = is_dynamic
         return is_dynamic
     
-    def _convert_alpha_to_tao(self, alpha_amount_rao, netuid):
+    def _convert_alpha_to_tao(self, alpha_amount_rao, netuid, substrate=None):
         """Convert alpha token amount (in RAO) to TAO using latest subnet price."""
         if alpha_amount_rao is None or alpha_amount_rao <= 0:
             return None
@@ -812,7 +1114,7 @@ class MempoolMonitor:
         if netuid is None:
             return None
 
-        price_alpha_per_tao = self._get_subnet_price(netuid)
+        price_alpha_per_tao = self._get_subnet_price(netuid, substrate=substrate)
         alpha_tokens = alpha_amount_rao / 1e9
         if price_alpha_per_tao is None or price_alpha_per_tao <= 0:
             return None
@@ -826,41 +1128,258 @@ class MempoolMonitor:
     _SLIPPAGE_MIN_SPOT_TAO = 1e-9
     _SLIPPAGE_DISPLAY_CAP_PCT = 999.0
 
-    def _slippage_pct(self, netuid, limit_price_rao):
-        """User-declared slippage tolerance for *_stake_limit extrinsics.
-
-        Returns |limit_price - current_spot| / current_spot * 100, or None when:
-          - no limit_price was supplied,
-          - the subnet price is unavailable / degenerate,
-          - `limit_price` is a sentinel (e.g. u64::MAX, 0) that does not encode
-            a real tolerance,
-          - the computed percentage exceeds the sane display cap.
-        """
-        if limit_price_rao is None or netuid is None:
+    @staticmethod
+    def _normalize_limit_price_rao(limit_price_rao):
+        if limit_price_rao is None:
             return None
+        if isinstance(limit_price_rao, dict):
+            for k in ("value", "Value", "rao", "amount", "tao"):
+                if k in limit_price_rao and limit_price_rao[k] is not None:
+                    limit_price_rao = limit_price_rao[k]
+                    break
         try:
-            lp_rao = int(limit_price_rao)
+            lp = int(limit_price_rao)
         except (TypeError, ValueError):
             return None
-        if lp_rao <= 0 or lp_rao >= self._SLIPPAGE_MAX_LIMIT_PRICE_RAO:
+        if lp <= 0:
             return None
+        return lp
 
-        nid = netuid[0] if isinstance(netuid, tuple) else netuid
-        alpha_per_tao = self._get_subnet_price(nid)
+    @staticmethod
+    def _tao_per_alpha_from_pool_row(tp) -> float | None:
+        if not tp:
+            return None
+        try:
+            ai = float(tp.get("alpha_in") or 0)
+            ti = float(tp.get("tao_in") or 0)
+        except (TypeError, ValueError):
+            return None
+        if ai > 0 and ti > 0:
+            return ti / ai
+        return None
+
+    def _tao_per_alpha_spot(self, netuid, substrate=None) -> float | None:
+        """Current spot τ per α for ``netuid``."""
+        if netuid is None:
+            return None
+        nid = int(netuid[0] if isinstance(netuid, tuple) else netuid)
+        tp = self._tracker_prices.get(nid) if self._tracker_prices else None
+        spot = self._tao_per_alpha_from_pool_row(tp)
+        if spot is not None:
+            return spot
+        alpha_per_tao = self._get_subnet_price(nid, substrate=substrate)
         if not alpha_per_tao or alpha_per_tao <= 0:
             return None
-        tao_per_alpha_now = 1.0 / alpha_per_tao
-        if tao_per_alpha_now < self._SLIPPAGE_MIN_SPOT_TAO:
+        return 1.0 / alpha_per_tao
+
+    def _capture_block_spot_table(self, substrate=None) -> None:
+        """Snapshot τ/α per netuid from the warm price table (+ RPC fill)."""
+        table: dict[int, float] = {}
+        for nid, tp in (self._tracker_prices or {}).items():
+            spot = self._tao_per_alpha_from_pool_row(tp)
+            if spot is not None:
+                table[int(nid)] = spot
+        self._last_block_tao_per_alpha = table
+
+    def _remember_mempool_spots(self, tx_hash: str | None, ops: list) -> None:
+        """Freeze spot τ/α for netuids touched by a newly seen pending extrinsic."""
+        if not tx_hash or not ops:
+            return
+        for op in ops:
+            kind = str(op.get("kind") or "")
+            if "swap_stake" in kind:
+                origin = op.get("origin_netuid")
+                if origin is None and op.get("netuid") is not None:
+                    nu = op.get("netuid")
+                    origin = nu[0] if isinstance(nu, tuple) else nu
+                dest = op.get("destination_netuid")
+                if dest is None and isinstance(op.get("netuid"), tuple):
+                    dest = op.get("netuid")[1]
+                for nid in (origin, dest):
+                    if nid is None:
+                        continue
+                    key = (tx_hash, int(nid))
+                    if key not in self._mempool_spot_at_seen:
+                        spot = self._tao_per_alpha_spot(int(nid))
+                        if spot is not None:
+                            self._mempool_spot_at_seen[key] = spot
+                continue
+            nu = op.get("netuid")
+            if nu is None or isinstance(nu, tuple):
+                continue
+            key = (tx_hash, int(nu))
+            if key not in self._mempool_spot_at_seen:
+                spot = self._tao_per_alpha_spot(int(nu))
+                if spot is not None:
+                    self._mempool_spot_at_seen[key] = spot
+
+    def _mempool_spot_for(self, tx_hash: str | None, netuid) -> float | None:
+        if not tx_hash or netuid is None:
+            return None
+        nid = int(netuid[0] if isinstance(netuid, tuple) else netuid)
+        return self._mempool_spot_at_seen.get((tx_hash, nid))
+
+    def _slippage_pct(
+        self,
+        netuid,
+        limit_price_rao,
+        *,
+        kind: str | None = None,
+        spot_tao_per_alpha: float | None = None,
+        spot_origin: float | None = None,
+        spot_dest: float | None = None,
+    ):
+        """User-declared slippage tolerance for *_stake_limit extrinsics.
+
+        Uses spot frozen at mempool first-seen (or block snapshot for Last block)
+        rather than the live spot, which drifts while txs sit in the pool.
+
+        ``swap_stake_limit`` encodes a cross-subnet α-price ratio, not τ/α on one
+        netuid — those rows use a separate ratio formula.
+        """
+        lp_rao = self._normalize_limit_price_rao(limit_price_rao)
+        if lp_rao is None or netuid is None:
+            return None
+        if lp_rao >= self._SLIPPAGE_MAX_LIMIT_PRICE_RAO:
             return None
 
-        limit_tao_per_alpha = float(lp_rao) / 1e9
+        kind_s = (kind or "").lower()
+
+        if "swap_stake" in kind_s:
+            origin = None
+            dest = None
+            if isinstance(netuid, tuple) and len(netuid) == 2:
+                origin, dest = netuid
+            else:
+                origin = netuid
+            if origin is None or dest is None:
+                return None
+            o_spot = spot_origin or self._last_block_tao_per_alpha.get(int(origin))
+            d_spot = spot_dest or self._last_block_tao_per_alpha.get(int(dest))
+            if o_spot is None:
+                o_spot = self._tao_per_alpha_spot(int(origin))
+            if d_spot is None:
+                d_spot = self._tao_per_alpha_spot(int(dest))
+            if not o_spot or not d_spot:
+                return None
+            current_ratio = o_spot / d_spot
+            limit_ratio = lp_rao / 1e9
+            if current_ratio <= 0 or limit_ratio <= 0:
+                return None
+            try:
+                pct = (1.0 - limit_ratio / current_ratio) * 100.0
+            except (ZeroDivisionError, TypeError):
+                return None
+            if not (pct == pct) or pct < 0 or pct > self._SLIPPAGE_DISPLAY_CAP_PCT:
+                return None
+            return pct
+
+        nid = int(netuid[0] if isinstance(netuid, tuple) else netuid)
+        spot = spot_tao_per_alpha
+        if spot is None:
+            spot = self._last_block_tao_per_alpha.get(nid)
+        if spot is None:
+            spot = self._tao_per_alpha_spot(nid)
+        if not spot or spot < self._SLIPPAGE_MIN_SPOT_TAO:
+            return None
+
+        limit_tao_per_alpha = lp_rao / 1e9
+        import stake_tracker as st
+
+        st_t = st.stake_type(kind) if kind else None
         try:
-            pct = abs(limit_tao_per_alpha - tao_per_alpha_now) / tao_per_alpha_now * 100.0
+            if st_t == "REMOVE" or kind_s.endswith(":remove"):
+                pct = (1.0 - limit_tao_per_alpha / spot) * 100.0
+            elif st_t == "ADD" or kind_s.endswith(":add"):
+                pct = (limit_tao_per_alpha / spot - 1.0) * 100.0
+            else:
+                pct = abs(limit_tao_per_alpha - spot) / spot * 100.0
         except (ZeroDivisionError, TypeError):
             return None
         if not (pct == pct) or pct < 0 or pct > self._SLIPPAGE_DISPLAY_CAP_PCT:
             return None
         return pct
+
+    def _mempool_slippage_pct(self, merged: dict) -> float | None:
+        tx_hash = merged.get("_tx_hash")
+        netuid = merged.get("netuid")
+        kind = str(merged.get("kind") or "")
+        lp = merged.get("limit_price")
+
+        if "swap_stake" in kind:
+            origin = merged.get("origin_netuid")
+            dest = merged.get("destination_netuid")
+            if origin is None or dest is None:
+                if isinstance(netuid, tuple) and len(netuid) == 2:
+                    origin, dest = netuid
+                elif netuid is not None and not isinstance(netuid, tuple):
+                    if kind.endswith(":remove"):
+                        origin = netuid
+                    elif kind.endswith(":add"):
+                        dest = netuid
+            if origin is not None and dest is not None:
+                o_spot = self._mempool_spot_for(tx_hash, origin)
+                d_spot = self._mempool_spot_for(tx_hash, dest)
+                return self._slippage_pct(
+                    (int(origin), int(dest)),
+                    lp,
+                    kind=kind,
+                    spot_origin=o_spot,
+                    spot_dest=d_spot,
+                )
+
+        spot = self._mempool_spot_for(tx_hash, netuid)
+        return self._slippage_pct(
+            netuid,
+            lp,
+            kind=kind or None,
+            spot_tao_per_alpha=spot,
+        )
+
+    @staticmethod
+    def _last_block_slippage_kind(tx_type: str | None, method: str | None) -> str | None:
+        m = (method or "").lower()
+        if "swap" in m:
+            return "swap_stake_limit:remove"
+        if (tx_type or "").strip().lower() == "unstake":
+            return "remove_stake_limit"
+        if (tx_type or "").strip().lower() == "stake":
+            return "add_stake_limit"
+        return None
+
+    def _last_block_slippage_pct(self, merged_tx: dict) -> float | None:
+        netuid = merged_tx.get("netuid")
+        lp = merged_tx.get("limit_price")
+        tx_type = merged_tx.get("type")
+        method = merged_tx.get("method")
+        kind = self._last_block_slippage_kind(tx_type, method)
+        if isinstance(netuid, tuple) and len(netuid) == 2 and "swap" in (method or "").lower():
+            o, d = int(netuid[0]), int(netuid[1])
+            return self._slippage_pct(
+                netuid,
+                lp,
+                kind=kind,
+                spot_origin=self._last_block_tao_per_alpha.get(o),
+                spot_dest=self._last_block_tao_per_alpha.get(d),
+            )
+        if netuid is None:
+            return None
+        nid = int(netuid[0] if isinstance(netuid, tuple) else netuid)
+        return self._slippage_pct(
+            netuid,
+            lp,
+            kind=kind,
+            spot_tao_per_alpha=self._last_block_tao_per_alpha.get(nid),
+        )
+
+    def _drop_mempool_spots_for_ext(self, ext_hex: str) -> None:
+        ext = self._mempool_decoded.get(ext_hex) or {}
+        tx_hash = str(ext.get("tx_hash") or "")
+        if not tx_hash:
+            return
+        for key in list(self._mempool_spot_at_seen):
+            if key[0] == tx_hash:
+                del self._mempool_spot_at_seen[key]
 
     
     def get_pending_extrinsics(self):
@@ -923,7 +1442,7 @@ class MempoolMonitor:
         except Exception:
             return None
 
-    def _orphan_failed_rows(self, block_hash, fail_set, agg_ext_idx_set):
+    def _orphan_failed_rows(self, block_hash, fail_set, agg_ext_idx_set, substrate=None):
         """Emit synthetic LastBlockRow entries for failed extrinsics with no events.
 
         Substrate extrinsics are atomic: when a stake-related extrinsic fails
@@ -943,8 +1462,9 @@ class MempoolMonitor:
         orphans = sorted(i for i in fail_set if i not in agg_ext_idx_set)
         if not orphans:
             return []
+        sub = substrate or self.substrate
         try:
-            resp = self.substrate.rpc_request("chain_getBlock", [block_hash])
+            resp = sub.rpc_request("chain_getBlock", [block_hash])
         except Exception as exc:
             logger.debug("chain_getBlock failed for %s: %s", block_hash, exc)
             return []
@@ -961,7 +1481,7 @@ class MempoolMonitor:
                 continue
             mod_idx = self._fast_extract_module_idx(ext_hex)
             try:
-                decoded = self._extrinsic_hex_to_tracker_ext(ext_hex)
+                decoded = self._extrinsic_hex_to_tracker_ext(ext_hex, substrate=sub)
             except Exception as exc:
                 logger.debug("decode_scale failed idx=%d: %s", idx, exc)
                 decoded = None
@@ -1014,7 +1534,7 @@ class MempoolMonitor:
                 netuid = op.get("netuid")
 
             try:
-                v = self._tracker_merged_op_amount_tao(op, prices)
+                v = self._tracker_merged_op_amount_tao(op, prices, substrate=sub)
                 amt = float(v) if v is not None else None
             except Exception:
                 amt = None
@@ -1052,12 +1572,13 @@ class MempoolMonitor:
             "limit_price": None,
         }
 
-    def parse_block_stake_transactions(self, block_number, block_hash=None, block=None, events=None):
+    def parse_block_stake_transactions(self, block_number, block_hash=None, block=None, events=None, substrate=None):
         """Parse stake transactions: all StakeAdded/Removed/Moved events (no TAO amount filter)."""
+        sub = substrate or self.substrate
         if block_hash is None:
-            block_hash = self.substrate.get_block_hash(block_number)
+            block_hash = sub.get_block_hash(block_number)
         if events is None:
-            events = self.substrate.get_events(block_hash)
+            events = sub.get_events(block_hash)
 
         import stake_tracker as st
 
@@ -1074,9 +1595,9 @@ class MempoolMonitor:
                 return True
             return True
 
-        rows = [self._tracker_event_to_last_block_row(ev, _ext_ok(ev.get("ext_idx"))) for ev in agg]
+        rows = [self._tracker_event_to_last_block_row(ev, _ext_ok(ev.get("ext_idx")), substrate=substrate) for ev in agg]
         agg_ext_idx_set = {ev.get("ext_idx") for ev in agg if ev.get("ext_idx") is not None}
-        rows.extend(self._orphan_failed_rows(block_hash, fail_set, agg_ext_idx_set))
+        rows.extend(self._orphan_failed_rows(block_hash, fail_set, agg_ext_idx_set, substrate=substrate))
         return rows
     
     def _netuid_to_json(self, netuid):
@@ -1145,39 +1666,41 @@ class MempoolMonitor:
         mempool_rows = []
         last_block_rows = []
         _get_bal = self._free_tao_cached
-        _get_stake = self._get_stake_cached
-
-        if not self._tracker_prices:
-            try:
-                p = st_bridge.fetch_prices_sync(self.substrate)
-                if p:
-                    self._tracker_prices = p
-            except Exception:
-                pass
 
         if self._mempool_stake:
             import stake_tracker as st
 
-            prices = self._tracker_prices or {}
             agg = st.aggregate_ops(self._mempool_stake, self._mempool_pool, self._mempool_seen_at)
+
+            prices = self._tracker_prices or {}
+            if not prices or any(
+                self._mempool_sell_needs_price_refresh(m, prices) for m in agg
+            ):
+                self._maybe_refresh_tracker_prices(force=not bool(prices))
+                prices = self._tracker_prices or {}
 
             fp = frozenset(self._mempool_stake.keys())
             if fp != self._mempool_keys_fp:
                 self._mempool_keys_fp = fp
                 for merged in agg:
-                    signer = self._resolve_signer_for_tracker_merged(merged)
-                    stake_addr = signer or merged.get("_address")
+                    coldkey = merged.get("_address")
+                    hotkey = merged.get("hotkey")
                     nu = merged.get("netuid")
-                    if stake_addr and nu is not None:
+                    if coldkey and hotkey and nu is not None:
                         if isinstance(nu, tuple) and len(nu) == 2:
                             for n in nu:
-                                ck = (stake_addr, n)
-                                if ck in self.stake_cache:
-                                    del self.stake_cache[ck]
+                                self.stake_cache.pop(
+                                    self._stake_cache_key(coldkey, hotkey, n), None
+                                )
                         else:
-                            ck = (stake_addr, nu)
-                            if ck in self.stake_cache:
-                                del self.stake_cache[ck]
+                            self.stake_cache.pop(
+                                self._stake_cache_key(coldkey, hotkey, nu), None
+                            )
+            else:
+                self._mempool_keys_fp = fp
+
+            sync_stake_budget = self._mempool_stake_sync_max
+            self._runtime_stake_entries_scratch.clear()
 
             for merged in agg:
                 age = int(merged.get("_age_s") or 0)
@@ -1200,17 +1723,35 @@ class MempoolMonitor:
                 netuid_for_balance = (
                     netuid[0] if isinstance(netuid, tuple) and len(netuid) == 2 else netuid
                 )
-                stake_addr = balance_address
-                alpha_tao = (
-                    _get_stake(stake_addr, netuid_for_balance)
-                    if netuid_for_balance is not None
-                    else None
-                )
+                # Full-unstake (Rem·F) extrinsics carry no alpha amount in the call.
+                # Look up stake by (coldkey, validator hotkey, netuid) via runtime API.
+                coldkey = merged.get("_address") or full_address
+                validator_hk = merged.get("hotkey")
+                stake_tao = None
+                if (
+                    validator_hk
+                    and netuid_for_balance is not None
+                    and coldkey
+                ):
+                    stake_tao = self._get_stake_cached(
+                        coldkey, validator_hk, netuid_for_balance
+                    )
+                    if (
+                        (stake_tao is None or stake_tao <= 0)
+                        and self._is_full_unstake_kind(merged.get("kind"))
+                        and sync_stake_budget > 0
+                    ):
+                        stake_tao = self._query_stake_tao_for_position(
+                            coldkey,
+                            validator_hk,
+                            netuid_for_balance,
+                            subtensor=self.subtensor,
+                        )
+                        sync_stake_budget -= 1
                 display_amount = amount
-                kind_l = (merged.get("kind") or "").lower()
-                if (display_amount is None or display_amount == 0.0) and alpha_tao and alpha_tao > 0:
-                    if "unstake_all" in kind_l or "remove_stake_full_limit" in kind_l:
-                        display_amount = alpha_tao
+                if (display_amount is None or display_amount == 0.0) and stake_tao and stake_tao > 0:
+                    if self._is_full_unstake_kind(merged.get("kind")):
+                        display_amount = stake_tao
                 # ``addressKey`` is the per-op identity used by
                 # ``stake_tracker.aggregate_ops`` — i.e. ``proxy_real`` when a
                 # Proxy.proxy wraps the call, otherwise the signer. The public
@@ -1244,9 +1785,8 @@ class MempoolMonitor:
                     "netuid": netuid_str,
                     "netuidJson": self._netuid_to_json(netuid),
                     "freeTao": free_tao,
-                    "alphaTao": alpha_tao,
                     "limitPrice": merged.get("limit_price"),
-                    "slippagePct": self._slippage_pct(netuid, merged.get("limit_price")),
+                    "slippagePct": self._mempool_slippage_pct(merged),
                     # Canonical extrinsic hash (blake2b-256 of SCALE bytes) —
                     # consumed by the UI as a stable React row key so sort /
                     # insert ops don't remount every row.
@@ -1295,7 +1835,6 @@ class MempoolMonitor:
                 merged_txs[key]['count'] += 1
             
             merged_items = sorted(merged_txs.items(), key=lambda x: (x[1].get('extrinsic_idx') or 0, str(x[0])))
-            running_alpha = {}
             for _key, merged_tx in merged_items:
                 method = (merged_tx.get('method') or '').lower()
                 netuid = merged_tx.get('netuid')
@@ -1321,28 +1860,6 @@ class MempoolMonitor:
                 )
                 stake_addr = merged_tx.get('coldkey') or full_address
                 free_tao = _get_bal(stake_addr, free_balance_scratch)
-                if isinstance(netuid, tuple) and len(netuid) == 2:
-                    netuid_for_balance = netuid[0]
-                else:
-                    netuid_for_balance = netuid
-                alpha_key = (stake_addr, netuid_for_balance)
-                if alpha_key not in running_alpha:
-                    running_alpha[alpha_key] = (
-                        _get_stake(stake_addr, netuid_for_balance)
-                        if netuid_for_balance is not None else None
-                    )
-                chain_alpha = running_alpha[alpha_key]
-                if isinstance(chain_alpha, (int, float)) and chain_alpha is not None:
-                    tx_amt = amount if isinstance(amount, (int, float)) and amount is not None else 0.0
-                    if merged_tx['type'].lower() == 'stake' and tx_amt > 0:
-                        alpha_tao = chain_alpha + tx_amt
-                    elif merged_tx['type'].lower() == 'unstake' and tx_amt > 0:
-                        alpha_tao = max(0.0, chain_alpha - tx_amt)
-                    else:
-                        alpha_tao = chain_alpha
-                    running_alpha[alpha_key] = alpha_tao
-                else:
-                    alpha_tao = chain_alpha
                 last_block_rows.append({
                     'section': 'lastBlock',
                     'extrinsicIdx': ext_idx,
@@ -1354,15 +1871,14 @@ class MempoolMonitor:
                     'netuid': netuid_str,
                     'netuidJson': self._netuid_to_json(netuid),
                     'freeTao': free_tao,
-                    'alphaTao': alpha_tao,
                     'success': merged_tx['success'],
                     'limitPrice': merged_tx.get('limit_price'),
-                    'slippagePct': self._slippage_pct(netuid, merged_tx.get('limit_price')),
+                    'slippagePct': self._last_block_slippage_pct(merged_tx),
                 })
         
         transfer_rows = [
             r
-            for r in self._transfer_history
+            for r in list(self._transfer_history)
             if not self._transfer_event_excluded(
                 r.get("from") or "",
                 r.get("to") or "",
@@ -1382,7 +1898,7 @@ class MempoolMonitor:
     
 
     
-    def _fetch_block_extrinsics(self, block_hash) -> list:
+    def _fetch_block_extrinsics(self, block_hash, substrate=None) -> list:
         """Return the list of hex-encoded extrinsics in ``block_hash``.
 
         Used by ``process_new_block`` to proactively evict confirmed txs from
@@ -1390,7 +1906,7 @@ class MempoolMonitor:
         caller can fall back to the slower implicit eviction path.
         """
         try:
-            resp = self.substrate.rpc_request("chain_getBlock", [block_hash])
+            resp = (substrate or self.substrate).rpc_request("chain_getBlock", [block_hash])
         except Exception as exc:
             logger.debug("chain_getBlock(%s) failed: %s", block_hash, exc)
             return []
@@ -1401,30 +1917,44 @@ class MempoolMonitor:
         exts = block.get('extrinsics') or []
         return exts if isinstance(exts, list) else []
 
-    def process_new_block(self, block_number):
+    def process_new_block(self, block_number, substrate=None):
         """Process a new block: fetch events, parse stake transactions,
         and proactively purge confirmed txs from the mempool caches so they
         disappear from the UI within one block instead of waiting for the
         chain's txpool eviction timer (~30 s on Finney).
+
+        ``substrate`` lets a dedicated block-processing thread pass its own
+        ``SubstrateInterface`` so every RPC here runs on a connection separate
+        from the main loop's mempool poller — block processing then no longer
+        serializes behind ``poll_mempool`` / ``build_ui_snapshot``.
         """
+        sub = substrate or self.substrate
         try:
-            block_hash = self.substrate.get_block_hash(block_number)
+            block_hash = sub.get_block_hash(block_number)
         except Exception as exc:
             logger.error("get_block_hash failed for block %s: %s", block_number, exc)
             return
 
-        try:
-            p = st_bridge.fetch_prices_sync(self.substrate)
-            if p:
-                self._tracker_prices = p
-        except Exception:
-            pass
+        # Throttled full price-table refresh (see ``_price_refresh_sec``). The
+        # heavy ``query_map`` pair only runs roughly once per block-time, not on
+        # every processed block, which matters most during catch-up when many
+        # blocks are processed back-to-back.
+        now_mono = time.monotonic()
+        if now_mono - self._last_price_fetch >= self._price_refresh_sec:
+            try:
+                p = st_bridge.fetch_prices_sync(sub)
+                if p:
+                    self._tracker_prices = p
+                self._last_price_fetch = now_mono
+            except Exception:
+                pass
+        self._capture_block_spot_table(substrate=sub)
 
         events: list | None = None
         last_err: Exception | None = None
         for attempt in range(2):
             try:
-                events = self.substrate.get_events(block_hash)
+                events = sub.get_events(block_hash)
                 break
             except Exception as exc:
                 last_err = exc
@@ -1452,35 +1982,39 @@ class MempoolMonitor:
         # evict matching ``ext_hex`` from every mempool cache, then remember
         # the hashes in ``_confirmed_exts`` so the next poll cycle does not
         # re-insert them while the chain pool is still advertising them.
-        block_exts = self._fetch_block_extrinsics(block_hash)
+        # NOTE: this runs on the dedicated block-processing thread while the
+        # main loop concurrently rebuilds the mempool dicts in ``poll_mempool``
+        # and iterates them in ``build_ui_snapshot``. To stay thread-safe we do
+        # NOT mutate the shared ``_mempool_pool`` / ``_mempool_stake`` /
+        # ``_mempool_seen_at`` dicts here (mutating a dict another thread is
+        # iterating raises ``RuntimeError``). Instead we only record the
+        # confirmed extrinsic hashes in ``_confirmed_exts`` (set ``.add`` is
+        # atomic under the GIL). ``poll_mempool`` already short-circuits any
+        # hash in ``_confirmed_exts`` and rebuilds ``_mempool_pool`` /
+        # ``_mempool_stake`` from scratch each cycle, so the confirmed tx drops
+        # out of the UI on the very next poll (≤ a few hundred ms) — the same
+        # visible result as the old in-place purge, without the cross-thread
+        # mutation hazard.
+        block_exts = self._fetch_block_extrinsics(block_hash, substrate=sub)
         if block_exts:
-            purged = 0
+            newly_confirmed = 0
             for ext_hex in block_exts:
-                if (
-                    ext_hex in self._mempool_pool
-                    or ext_hex in self._mempool_stake
-                    or ext_hex in self._mempool_decoded
-                ):
-                    purged += 1
-                self._mempool_pool.pop(ext_hex, None)
-                self._mempool_stake.pop(ext_hex, None)
-                self._mempool_seen_at.pop(ext_hex, None)
-                self._mempool_decoded.pop(ext_hex, None)
-                self._non_stake_exts.discard(ext_hex)
+                if ext_hex not in self._confirmed_exts:
+                    newly_confirmed += 1
                 self._confirmed_exts.add(ext_hex)
-            if purged:
+            if newly_confirmed:
                 # Invalidate the snapshot fingerprint so the next
                 # ``build_ui_snapshot`` observes the shrunk mempool even if
                 # nothing else changed between polls.
                 self._mempool_keys_fp = None
                 logger.info(
-                    "mempool: purged %d confirmed tx(s) from block %s",
-                    purged, block_number,
+                    "mempool: %d confirmed tx(s) from block %s flagged for eviction",
+                    newly_confirmed, block_number,
                 )
 
         try:
             self.last_block_data = self.parse_block_stake_transactions(
-                block_number, block_hash=block_hash, events=events
+                block_number, block_hash=block_hash, events=events, substrate=substrate
             )
         except Exception:
             logger.exception("parse_block_stake_transactions failed block=%s", block_number)
@@ -1496,6 +2030,19 @@ class MempoolMonitor:
 
         self._append_block_transfers(block_number)
 
+        # Targeted balance refresh for addresses that actually transacted in
+        # this block. Their on-chain free balance just changed, so the cached
+        # value is now stale and ``freeTao`` would show the pre-trade amount.
+        #
+        # We deliberately do NOT use the old blanket ``free_balance_cache.pop``:
+        # that both blanked the cell and forced a cache *miss* (hence a
+        # ``System.Account`` RPC) for every transacting address every block.
+        # Instead we mark only these entries stale (timestamp 0) so
+        # ``_free_tao_cached`` re-queues exactly them for a background refresh on
+        # the next snapshot, while still returning the last known value in the
+        # meantime (no blank). Non-transacting addresses keep refreshing on the
+        # gentle ``_balance_refresh_sec`` cadence. This restores post-trade
+        # accuracy without reintroducing the per-block RPC storm (direction 2).
         affected_addrs = set()
         for tx in self.last_block_data:
             for key in ('address', 'coldkey', 'hotkey'):
@@ -1503,10 +2050,9 @@ class MempoolMonitor:
                 if addr:
                     affected_addrs.add(addr)
         for addr in affected_addrs:
-            self.free_balance_cache.pop(addr, None)
-            for k in list(self.stake_cache.keys()):
-                if k[0] == addr:
-                    del self.stake_cache[k]
+            cached = self.free_balance_cache.get(addr)
+            if cached:
+                cached['time'] = 0.0
         self._last_seen_block = block_number
 
     def poll_mempool(self):
@@ -1522,6 +2068,7 @@ class MempoolMonitor:
         seen_at = self._mempool_seen_at
         pool = {}
         stake = {}
+        newly_seen: set[str] = set()
 
         for ext_hex in pending:
             if ext_hex in self._non_stake_exts:
@@ -1549,6 +2096,7 @@ class MempoolMonitor:
             pool[ext_hex] = ext
             if ext_hex not in seen_at:
                 seen_at[ext_hex] = now
+                newly_seen.add(ext_hex)
 
         # Expire pending extrinsics that have been tracked for longer than the
         # configured age cap. The chain node's local txpool can hold stuck or
@@ -1579,15 +2127,19 @@ class MempoolMonitor:
                 for h in expired:
                     pool.pop(h, None)
                     seen_at.pop(h, None)
+                    self._drop_mempool_spots_for_ext(h)
                     self._mempool_decoded.pop(h, None)
                     self._non_stake_exts.add(h)
 
         for k in list(seen_at):
             if k not in pool:
                 seen_at.pop(k, None)
+                self._drop_mempool_spots_for_ext(k)
+        # ``.pop(k, None)`` (not ``del``) — the dedicated block thread may have
+        # popped the same key first; ``del`` would raise ``KeyError``.
         for k in list(self._mempool_decoded):
             if k not in current_pending:
-                del self._mempool_decoded[k]
+                self._mempool_decoded.pop(k, None)
 
         for h, ext in pool.items():
             try:
@@ -1603,6 +2155,9 @@ class MempoolMonitor:
                 continue
             if ops:
                 stake[h] = ops
+                if h in newly_seen:
+                    tx_hash = str(ext.get("tx_hash") or "") or None
+                    self._remember_mempool_spots(tx_hash, ops)
 
         self._mempool_pool = pool
         self._mempool_stake = stake

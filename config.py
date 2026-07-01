@@ -55,9 +55,16 @@ BOT_AUTOSTART: bool = os.environ.get("BOT_AUTOSTART", "false").strip().lower() i
     "on",
 )
 
-# Mempool monitor loop sleep (defaults match pre–adaptive behavior; use env to tune).
-MEMPOOL_POLL_BUSY_SEC: float = float(os.environ.get("MEMPOOL_POLL_BUSY_SEC", "0.02"))
-MEMPOOL_POLL_IDLE_SEC: float = float(os.environ.get("MEMPOOL_POLL_IDLE_SEC", "0.02"))
+# Mempool monitor loop sleep. These throttle ``author_pendingExtrinsics`` polling
+# on the SHARED ``self.substrate`` WS so it stops starving block processing
+# (get_events / chain_getBlock) on the same connection. At the old 0.02s the loop
+# hit the RPC ~50x/sec, which on the public Finney endpoint stalled block
+# advancement (blocks "froze" then jumped via catch-up). 0.2/0.5s cuts that to
+# ~2-5x/sec while the block-header subscription still detects new blocks instantly.
+# Tune via env: lower BUSY (e.g. 0.1) for a more live mempool panel at the cost of
+# more RPC contention.
+MEMPOOL_POLL_BUSY_SEC: float = float(os.environ.get("MEMPOOL_POLL_BUSY_SEC", "0.2"))
+MEMPOOL_POLL_IDLE_SEC: float = float(os.environ.get("MEMPOOL_POLL_IDLE_SEC", "0.5"))
 # Poll best head on this interval so we still advance if block subscription connects late or drops.
 MEMPOOL_HEAD_POLL_SEC: float = float(os.environ.get("MEMPOOL_HEAD_POLL_SEC", "0.4"))
 # Max blocks processed in one catch-up burst (avoids long stalls if RPC returns a bogus gap).
