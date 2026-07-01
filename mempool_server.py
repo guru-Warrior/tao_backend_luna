@@ -173,7 +173,33 @@ def _put(msg: Dict[str, Any]) -> None:
         pass
 
 
-def _catch_up_blocks_to_target(mon: MempoolMonitor, target_bn: int, substrate=None) -> tuple[int, bool]:
+def _emit_block_history(
+    mon: MempoolMonitor,
+    block_number: int,
+    loop: asyncio.AbstractEventLoop | None,
+) -> None:
+    """Push one block's last-block rows for tx-history (survives multi-block catch-up)."""
+    if loop is None:
+        return
+    rows = mon.build_last_block_ui_rows()
+    if not rows:
+        return
+    loop.call_soon_threadsafe(
+        _put,
+        {
+            "type": "block_history",
+            "blockNumber": block_number,
+            "lastBlock": rows,
+        },
+    )
+
+
+def _catch_up_blocks_to_target(
+    mon: MempoolMonitor,
+    target_bn: int,
+    substrate=None,
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> tuple[int, bool]:
     """Process ``_last_seen_block + 1 .. target_bn`` (capped). Returns ``(last_bn, advanced)``.
 
     ``substrate`` (when given) is forwarded to ``process_new_block`` so the
@@ -192,10 +218,16 @@ def _catch_up_blocks_to_target(mon: MempoolMonitor, target_bn: int, substrate=No
         target_bn = prev + MEMPOOL_MAX_CATCHUP_BLOCKS
     for b in range(prev + 1, target_bn + 1):
         mon.process_new_block(b, substrate=substrate)
+        _emit_block_history(mon, b, loop)
     return target_bn, True
 
 
-def _poll_chain_head_catchup(mon: MempoolMonitor, current_block: int, substrate=None) -> tuple[int, bool]:
+def _poll_chain_head_catchup(
+    mon: MempoolMonitor,
+    current_block: int,
+    substrate=None,
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> tuple[int, bool]:
     """Read best head via RPC; catch up to tip (same block-number parsing as bootstrap)."""
     import chain_head_cache as _head_cache
     sub = substrate or mon.substrate
@@ -208,7 +240,7 @@ def _poll_chain_head_catchup(mon: MempoolMonitor, current_block: int, substrate=
         # Keep trader's era fast-path warm even when the subscription WS is
         # flaky — this branch polls the head itself so we know the number.
         _head_cache.put(head_bn)
-        last_bn, advanced = _catch_up_blocks_to_target(mon, head_bn, substrate=substrate)
+        last_bn, advanced = _catch_up_blocks_to_target(mon, head_bn, substrate=substrate, loop=loop)
         if advanced:
             return last_bn, True
         return current_block, False
@@ -341,7 +373,7 @@ def _block_processing_thread(
             if now - last_head_poll >= MEMPOOL_HEAD_POLL_SEC:
                 last_head_poll = now
                 new_bn, adv = _poll_chain_head_catchup(
-                    mon, current_block_holder[0], substrate=block_sub
+                    mon, current_block_holder[0], substrate=block_sub, loop=loop
                 )
                 if adv:
                     current_block_holder[0] = new_bn
@@ -353,7 +385,7 @@ def _block_processing_thread(
                 bn = new_block_number[0]
                 if bn > (mon._last_seen_block or 0):
                     last_bn, adv = _catch_up_blocks_to_target(
-                        mon, bn, substrate=block_sub
+                        mon, bn, substrate=block_sub, loop=loop
                     )
                     if adv:
                         current_block_holder[0] = last_bn
@@ -686,6 +718,15 @@ async def queue_consumer() -> None:
                 except Exception as e:
                     raw = _json_dumps_compact({"type": "wallet_error", "message": str(e)})
                     await hub.broadcast_raw(raw)
+        elif mtype == "block_history":
+            raw = _json_dumps_compact(
+                {
+                    "type": "block_history",
+                    "blockNumber": msg.get("blockNumber"),
+                    "lastBlock": msg.get("lastBlock") or [],
+                }
+            )
+            await hub.broadcast_raw(raw)
         elif mtype == "block":
             # Lightweight block-number tick, broadcast immediately (no fp
             # dedupe, no snapshot build) so the UI block counter/timer updates

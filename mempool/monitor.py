@@ -1659,6 +1659,105 @@ class MempoolMonitor:
         base = _short.get(base, base)
         return (wrapper_prefix + base)[:max_width]
 
+    def build_last_block_ui_rows(
+        self,
+        block_data=None,
+        free_balance_scratch=None,
+        method_col_width: int = 18,
+    ) -> list:
+        """Build Last-block panel rows from parsed ``last_block_data``."""
+        block_data = self.last_block_data if block_data is None else block_data
+        if free_balance_scratch is None:
+            free_balance_scratch = {}
+        _get_bal = self._free_tao_cached
+        last_block_rows: list = []
+        if not block_data:
+            return last_block_rows
+
+        merged_txs = {}
+        for tx in block_data:
+            method = (tx.get('method') or '').lower()
+            netuid = tx.get('netuid')
+            is_move_stake = 'move_stake' in method or method == 'move'
+            is_transfer_stake = 'transfer_stake' in method or method == 'xfer'
+            if (is_move_stake or is_transfer_stake) and isinstance(netuid, tuple) and len(netuid) == 2:
+                origin, dest = netuid
+                if origin == dest:
+                    continue
+            ext_idx = tx['extrinsic_idx']
+            tx_type = tx['type']
+            tx_method = tx['method']
+            tx_address = tx['address']
+            key = (ext_idx, tx_type, tx_method, tx_address, netuid)
+            if key not in merged_txs:
+                merged_txs[key] = {
+                    'extrinsic_idx': ext_idx,
+                    'type': tx_type,
+                    'method': tx_method,
+                    'address': tx_address,
+                    'coldkey': tx.get('coldkey'),
+                    'netuid': netuid,
+                    'amount': tx['amount'],
+                    'success': tx.get('success', True),
+                    'count': 0,
+                    'limit_price': tx.get('limit_price'),
+                }
+            else:
+                a = merged_txs[key]['amount']
+                b = tx['amount']
+                if a is None or b is None:
+                    merged_txs[key]['amount'] = None
+                else:
+                    merged_txs[key]['amount'] = a + b
+            merged_txs[key]['success'] = merged_txs[key]['success'] and tx.get('success', True)
+            merged_txs[key]['count'] += 1
+
+        merged_items = sorted(
+            merged_txs.items(),
+            key=lambda x: (x[1].get('extrinsic_idx') or 0, str(x[0])),
+        )
+        for _key, merged_tx in merged_items:
+            method = (merged_tx.get('method') or '').lower()
+            netuid = merged_tx.get('netuid')
+            is_move_stake = 'move_stake' in method or method == 'move'
+            is_transfer_stake = 'transfer_stake' in method or method == 'xfer'
+            if (is_move_stake or is_transfer_stake) and isinstance(netuid, tuple) and len(netuid) == 2:
+                origin, dest = netuid
+                if origin == dest:
+                    continue
+            full_address = merged_tx['address']
+            display_name = full_address
+            netuid = merged_tx.get('netuid')
+            if netuid is None:
+                netuid_str = None
+            elif isinstance(netuid, tuple) and len(netuid) == 2:
+                netuid_str = f"{netuid[0]}→{netuid[1]}"
+            else:
+                netuid_str = str(netuid)
+            amount = merged_tx.get('amount', 0.0)
+            ext_idx = merged_tx['extrinsic_idx']
+            method_label = self._ui_last_block_method(
+                merged_tx.get('method', ''), method_col_width
+            )
+            stake_addr = merged_tx.get('coldkey') or full_address
+            free_tao = _get_bal(stake_addr, free_balance_scratch)
+            last_block_rows.append({
+                'section': 'lastBlock',
+                'extrinsicIdx': ext_idx,
+                'type': merged_tx['type'],
+                'method': method_label,
+                'address': full_address,
+                'addressLabel': display_name,
+                'amount': None if (amount is None or amount == 0.0) else float(amount),
+                'netuid': netuid_str,
+                'netuidJson': self._netuid_to_json(netuid),
+                'freeTao': free_tao,
+                'success': merged_tx['success'],
+                'limitPrice': merged_tx.get('limit_price'),
+                'slippagePct': self._last_block_slippage_pct(merged_tx),
+            })
+        return last_block_rows
+
     def build_ui_snapshot(self, current_block):
         """Structured mempool + last-block rows for WebSocket JSON (cache-only + bg RPC fill)."""
         free_balance_scratch = {}
@@ -1794,87 +1893,12 @@ class MempoolMonitor:
                 })
         else:
             self._mempool_keys_fp = frozenset()
-        
-        if self.last_block_data:
-            merged_txs = {}
-            for tx in self.last_block_data:
-                method = (tx.get('method') or '').lower()
-                netuid = tx.get('netuid')
-                is_move_stake = 'move_stake' in method or method == 'move'
-                is_transfer_stake = 'transfer_stake' in method or method == 'xfer'
-                if (is_move_stake or is_transfer_stake) and isinstance(netuid, tuple) and len(netuid) == 2:
-                    origin, dest = netuid
-                    if origin == dest:
-                        continue
-                ext_idx = tx['extrinsic_idx']
-                tx_type = tx['type']
-                tx_method = tx['method']
-                tx_address = tx['address']
-                key = (ext_idx, tx_type, tx_method, tx_address, netuid)
-                if key not in merged_txs:
-                    merged_txs[key] = {
-                        'extrinsic_idx': ext_idx,
-                        'type': tx_type,
-                        'method': tx_method,
-                        'address': tx_address,
-                        'coldkey': tx.get('coldkey'),
-                        'netuid': netuid,
-                        'amount': tx['amount'],
-                        'success': True,
-                        'count': 0,
-                        'limit_price': tx.get('limit_price'),
-                    }
-                else:
-                    a = merged_txs[key]['amount']
-                    b = tx['amount']
-                    if a is None or b is None:
-                        merged_txs[key]['amount'] = None
-                    else:
-                        merged_txs[key]['amount'] = a + b
-                merged_txs[key]['success'] = merged_txs[key]['success'] and tx['success']
-                merged_txs[key]['count'] += 1
-            
-            merged_items = sorted(merged_txs.items(), key=lambda x: (x[1].get('extrinsic_idx') or 0, str(x[0])))
-            for _key, merged_tx in merged_items:
-                method = (merged_tx.get('method') or '').lower()
-                netuid = merged_tx.get('netuid')
-                is_move_stake = 'move_stake' in method or method == 'move'
-                is_transfer_stake = 'transfer_stake' in method or method == 'xfer'
-                if (is_move_stake or is_transfer_stake) and isinstance(netuid, tuple) and len(netuid) == 2:
-                    origin, dest = netuid
-                    if origin == dest:
-                        continue
-                full_address = merged_tx['address']
-                display_name = full_address
-                netuid = merged_tx.get('netuid')
-                if netuid is None:
-                    netuid_str = None
-                elif isinstance(netuid, tuple) and len(netuid) == 2:
-                    netuid_str = f"{netuid[0]}→{netuid[1]}"
-                else:
-                    netuid_str = str(netuid)
-                amount = merged_tx.get('amount', 0.0)
-                ext_idx = merged_tx['extrinsic_idx']
-                method_label = self._ui_last_block_method(
-                    merged_tx.get('method', ''), method_col_width
-                )
-                stake_addr = merged_tx.get('coldkey') or full_address
-                free_tao = _get_bal(stake_addr, free_balance_scratch)
-                last_block_rows.append({
-                    'section': 'lastBlock',
-                    'extrinsicIdx': ext_idx,
-                    'type': merged_tx['type'],
-                    'method': method_label,
-                    'address': full_address,
-                    'addressLabel': display_name,
-                    'amount': None if (amount is None or amount == 0.0) else float(amount),
-                    'netuid': netuid_str,
-                    'netuidJson': self._netuid_to_json(netuid),
-                    'freeTao': free_tao,
-                    'success': merged_tx['success'],
-                    'limitPrice': merged_tx.get('limit_price'),
-                    'slippagePct': self._last_block_slippage_pct(merged_tx),
-                })
+
+        last_block_rows = self.build_last_block_ui_rows(
+            self.last_block_data,
+            free_balance_scratch,
+            method_col_width,
+        )
         
         transfer_rows = [
             r
